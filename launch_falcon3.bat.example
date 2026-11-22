@@ -1,0 +1,14 @@
+@echo off
+REM ============================================================================
+REM Falcon 3.0 Gold — Native Host Launcher (GOG Falcon Gold + Munt CM-32L ROMs)
+REM ============================================================================
+REM 1. Rename this file from "launch_falcon3.bat.example" to "launch_falcon3.bat"
+REM 2. Update GAME_DIR to your GOG Falcon Gold install folder (root or FALCON3)
+REM 3. Update ROM_DIR  to your Roland CM-32L / MT-32 ROM folder
+REM 4. Double-click launch_falcon3.bat to fly!
+REM ============================================================================
+
+set "GAME_DIR=C:\GOG Games\Falcon Gold"
+set "ROM_DIR=C:\Path\To\Munt_ROMS\cm32l"
+
+start "" "%~dp0falcon30_native.exe" --game-dir "%GAME_DIR%" --rom-dir "%ROM_DIR%"
