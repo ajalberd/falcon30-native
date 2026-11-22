@@ -232,11 +232,13 @@ private:
     };
     struct ObjFace {
         uint8_t color_idx = 0;
+        uint8_t layer_idx = 0;
         ObjVec3 normal{};
         std::vector<uint16_t> verts;
     };
     struct ObjModel {
         std::string name;
+        bool is_ground_decal = false; // Flat ground-surface model (runways 26..49, taxiways 103, pads)
         std::vector<ObjVec3> verts;
         std::vector<ObjFace> faces;
     };
@@ -274,7 +276,7 @@ private:
     struct RoadSegment {
         double wx0 = 0.0, wy0 = 0.0;
         double wx1 = 0.0, wy1 = 0.0;
-        bool is_river = false;
+        uint8_t kind = 0; // 0 = road/highway, 1 = river (hi & 0x40), 2 = railroad / range boundary (hi & 0x80)
     };
     struct MapStructure {
         double wx = 0.0;
@@ -287,7 +289,9 @@ private:
         double wy = 0.0;
         float alt_ft = 0.0f;
         float heading_deg = 0.0f;
+        bool has_mapobj_runway = false;
     };
+    void sync_ils_mapobj_coverage();
     std::vector<MapFeature> map_features_;
     std::vector<RoadSegment> road_segments_;
     std::vector<MapStructure> map_structures_;

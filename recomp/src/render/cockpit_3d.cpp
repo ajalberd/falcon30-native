@@ -155,7 +155,8 @@ void Cockpit3D::upload_view_texture(int slot, const uint8_t* dac_768) {
                 rgba[y * kSpriteW + x] = 0x00000000u;
                 continue;
             }
-            if (idx < 128) {
+            bool is_pit = (slot == ViewForward && y < 102) ? (idx < 116) : (idx < 128);
+            if (is_pit) {
                 int r = (dac_768[idx * 3 + 0] * 255) / 63;
                 int g = (dac_768[idx * 3 + 1] * 255) / 63;
                 int b = (dac_768[idx * 3 + 2] * 255) / 63;

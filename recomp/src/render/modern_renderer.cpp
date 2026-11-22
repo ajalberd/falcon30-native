@@ -17,9 +17,9 @@ namespace {
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kDeg2Rad = kPi / 180.0f;
 constexpr double kHalfFtToKm = 0.0001524;          // 0.5 ft = 0.1524 m = 0.0001524 km
-constexpr double kTheaterHalfSpan = 3353600.0;     // 16 * 209,600 (0.5 ft units = 276 nm half-span)
-constexpr double kAltTileUnits = 209600.0;         // 32 tiles across 6,707,200 units
-constexpr double kIslVertScale = 209600.0 / 5502.0;// Verified ISLDAT.IRQ vertex -> 0.5 ft units
+constexpr double kTheaterHalfSpan = 3355648.0;     // 1024 * 3277 (verified 0.0-ft error vs ILS.* across all 8 theaters!)
+constexpr double kAltTileUnits = 209728.0;         // 32 tiles across 6,711,296 units (64 * 3277 per tile)
+constexpr double kIslVertScale = 209728.0 / 5502.0;// Verified ISLDAT.* vertex -> 0.5 ft units
 constexpr float kObjUnitToKm = 0.0000412f;         // Verified F16 365 units = 49.4 ft = 0.01505 km
 constexpr float kFalconFyVga = 285.75f;            // Verified from HUD: 5 deg = 25.0 VGA px
 
@@ -501,12 +501,23 @@ bool ModernRenderer::load_mapobj_models(const std::string& mapobj_path) {
         size_t base = static_cast<size_t>(o0) + 2;
         size_t blen = static_cast<size_t>(o1) - base;
 
+        // Mapobj LOD table: type-0x09 header stores highest-detail LOD0 pointer at base + 13
+        // (unlocks ALL 120 mapobj models including all 4 directions of 3D runways 26..49, bridges, SAMs & hangars!).
+        // Fallback to far-LOD 0xFFFF/0x4000 scan for any non-0x09 model.
         size_t lod_off = 0;
-        size_t max_scan = std::min<size_t>(blen - 10, 128);
-        for (size_t s = 2; s + 10 <= max_scan; ++s) {
-            if (rd16(d, base + s) == 0xFFFF && rd16(d, base + s + 2) == 0x4000) {
-                lod_off = s + 4;
-                break;
+        if (blen > 20 && d[base] == 0x09) {
+            uint16_t ptr0 = rd16(d, base + 13);
+            if (static_cast<size_t>(ptr0) + 6 <= blen) {
+                lod_off = ptr0;
+            }
+        }
+        if (lod_off == 0) {
+            size_t max_scan = std::min<size_t>(blen - 10, 128);
+            for (size_t s = 2; s + 10 <= max_scan; ++s) {
+                if (rd16(d, base + s) == 0xFFFF && rd16(d, base + s + 2) == 0x4000) {
+                    lod_off = s + 4;
+                    break;
+                }
             }
         }
         if (lod_off == 0) continue;
@@ -542,7 +553,9 @@ bool ModernRenderer::load_mapobj_models(const std::string& mapobj_path) {
         }
         if (groups.empty() && p < o1) groups.push_back(p);
 
-        for (size_t gp : groups) {
+        float max_used_abs_y = 0.0f;
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            size_t gp = groups[gi];
             if (gp + 6 > o1) continue;
             uint16_t flags = rd16(d, gp);
             uint16_t color_w = rd16(d, gp + 2);
@@ -552,11 +565,12 @@ bool ModernRenderer::load_mapobj_models(const std::string& mapobj_path) {
                 if (fp_cur + 2 > o1) break;
                 uint16_t nv = rd16(d, fp_cur);
                 fp_cur += 2;
-                if (nv == 0xFFFF || nv < 3 || nv > 16) break;
+                if (nv == 0xFFFF || nv < 3 || nv > 32) break;
                 if (fp_cur + (static_cast<size_t>(nv) + 1) * 2 > o1) break;
 
                 ObjFace face;
                 face.color_idx = static_cast<uint8_t>(color_w & 0xFF);
+                face.layer_idx = static_cast<uint8_t>(std::min<size_t>(gi, 255));
                 face.verts.reserve(nv);
                 bool valid = true;
                 for (uint16_t k = 0; k < nv; ++k) {
@@ -566,6 +580,10 @@ bool ModernRenderer::load_mapobj_models(const std::string& mapobj_path) {
                 }
                 fp_cur += (static_cast<size_t>(nv) + 1) * 2;
                 if (!valid) continue;
+
+                for (uint16_t vi : face.verts) {
+                    max_used_abs_y = std::max(max_used_abs_y, std::abs(mod.verts[vi].y));
+                }
 
                 const ObjVec3& a = mod.verts[face.verts[0]];
                 const ObjVec3& b = mod.verts[face.verts[1]];
@@ -582,6 +600,7 @@ bool ModernRenderer::load_mapobj_models(const std::string& mapobj_path) {
                 mod.faces.push_back(std::move(face));
             } while (multi);
         }
+        mod.is_ground_decal = !mod.faces.empty() && (max_used_abs_y < 0.0025f);
     }
     return !mapobj_models_.empty();
 }
@@ -605,11 +624,11 @@ bool ModernRenderer::load_mapobj_world(const std::string& mapobj_irq_path) {
         int gr = 0, gc = 0;
         double wx = 0.0, wy = 0.0;
         uint8_t lo_mask = 0;
-        bool is_river = false;
+        uint8_t hi_mask = 0;
+        uint8_t kind = 0; // 0 = road, 1 = river (hi & 0x40), 2 = railroad / range boundary (hi & 0x80)
     };
     std::vector<GridFeat> gfeats;
-    std::unordered_map<uint32_t, size_t> road_grid;
-    std::unordered_map<uint32_t, size_t> river_grid;
+    std::unordered_map<uint32_t, size_t> feat_grid;
     auto cell_key = [](int gr, int gc) -> uint32_t {
         return (static_cast<uint32_t>(gr & 0xFFF) << 12) | static_cast<uint32_t>(gc & 0xFFF);
     };
@@ -675,12 +694,14 @@ bool ModernRenderer::load_mapobj_world(const std::string& mapobj_irq_path) {
                                 map_features_.push_back({cwx, cwy, lo_mask, hi_mask});
                                 int gr = sr * 256 + subr * 64 + static_cast<int>(r_id) * 4 + (sub_cell >> 2);
                                 int gc = sc * 256 + subc * 64 + static_cast<int>(c_id) * 4 + (sub_cell & 3);
-                                // Pure river if hi_mask has river bits (0x01/0x02) and no road bits in lo_mask
-                                bool is_river = ((hi_mask & 0x03u) != 0) && (lo_mask == 0);
+                                // Verified Falcon 3.0 MAPOBJ.* feature type bits in hi_mask:
+                                //   hi & 0x40 = Real river (Colorado River/Lake Mead, Tigris & Euphrates!)
+                                //   hi & 0x80 = Railroad / Restricted Range boundary (Nellis Range box, Iraqi rail line)
+                                //   (hi & 0xC0) == 0 = Roads & highways (hi & 0x01 = full E-W straight, hi & 0x02 = full N-S straight!)
+                                uint8_t kind = (hi_mask & 0x40u) ? 1u : ((hi_mask & 0x80u) ? 2u : 0u);
                                 size_t idx = gfeats.size();
-                                gfeats.push_back({gr, gc, cwx, cwy, lo_mask, is_river});
-                                if (is_river) river_grid[cell_key(gr, gc)] = idx;
-                                else          road_grid[cell_key(gr, gc)] = idx;
+                                gfeats.push_back({gr, gc, cwx, cwy, lo_mask, hi_mask, kind});
+                                feat_grid[cell_key(gr, gc)] = idx;
                             }
                         }
                         if (nobj > 0 && nobj < 64 && obj_base + static_cast<uint32_t>(nobj) * 10 <= bnext) {
@@ -689,10 +710,10 @@ bool ModernRenderer::load_mapobj_world(const std::string& mapobj_irq_path) {
                                 uint16_t dy_u = rd16(m, rp + 0);
                                 uint16_t dx_u = rd16(m, rp + 2);
                                 uint8_t mid = m[rp + 6];
-                                uint8_t rot_b = m[rp + 8];
                                 double ox = cell_wx_n - std::clamp(static_cast<double>(dx_u), 0.0, kCellSz);
                                 double oy = cell_wy_w + std::clamp(static_cast<double>(dy_u), 0.0, kCellSz);
-                                map_structures_.push_back({ox, oy, mid, static_cast<float>(rot_b & 3) * 90.0f});
+                                // Note: byte rp+8 is a per-facility instance ID, NOT a rotation (orientations are baked into model_id!)
+                                map_structures_.push_back({ox, oy, mid, 0.0f});
                             }
                         }
                     }
@@ -701,78 +722,66 @@ bool ModernRenderer::load_mapobj_world(const std::string& mapobj_irq_path) {
         }
     }
 
-    // Build crisp, razor-sharp connected road & river segments directly from Falcon 3.0's decoded bitmasks:
-    //   Roads lo_mask low nibble:  0x01=S, 0x02=E, 0x04=W, 0x08=N (straight/90-deg roads)
-    //   Roads lo_mask high nibble: 0x10 (+0x80 paired neighbor) = exact 45-deg SW<->NE diagonal!
-    //                              0x20 (+0x40 paired neighbor) = exact 45-deg NW<->SE diagonal!
-    //   Rivers: 8-connected adjacency graph across river_grid!
+    // Build crisp, razor-sharp connected road, river & rail/boundary segments directly from Falcon 3.0's 10-bit geometry mask:
+    //   lo_mask low nibble:  0x01=S, 0x02=E, 0x04=W, 0x08=N (half-arms from center to cell edge)
+    //   lo_mask high nibble: 0x10 (+0x80 paired neighbor) = exact 45-deg SW<->NE diagonal!
+    //                        0x20 (+0x40 paired neighbor) = exact 45-deg NW<->SE diagonal!
+    //   hi_mask low 2 bits:  0x01 = full-cell straight E<->W, 0x02 = full-cell straight N<->S!
     road_segments_.reserve(gfeats.size() * 2);
     const double h = kCellSz * 0.5;
     for (const auto& gf : gfeats) {
-        if (gf.is_river) {
-            auto has_r = [&](int r, int c) -> bool { return river_grid.find(cell_key(r, c)) != river_grid.end(); };
-            bool conn = false;
-            if (auto it = river_grid.find(cell_key(gf.gr, gf.gc + 1)); it != river_grid.end()) {
-                const auto& nb = gfeats[it->second];
-                road_segments_.push_back({gf.wx, gf.wy, nb.wx, nb.wy, true});
-                conn = true;
-            }
-            if (auto it = river_grid.find(cell_key(gf.gr + 1, gf.gc)); it != river_grid.end()) {
-                const auto& nb = gfeats[it->second];
-                road_segments_.push_back({gf.wx, gf.wy, nb.wx, nb.wy, true});
-                conn = true;
-            }
-            if (!has_r(gf.gr, gf.gc + 1) && !has_r(gf.gr + 1, gf.gc)) {
-                if (auto it = river_grid.find(cell_key(gf.gr + 1, gf.gc + 1)); it != river_grid.end()) {
-                    const auto& nb = gfeats[it->second];
-                    road_segments_.push_back({gf.wx, gf.wy, nb.wx, nb.wy, true});
-                    conn = true;
-                }
-            }
-            if (!has_r(gf.gr, gf.gc - 1) && !has_r(gf.gr + 1, gf.gc)) {
-                if (auto it = river_grid.find(cell_key(gf.gr + 1, gf.gc - 1)); it != river_grid.end()) {
-                    const auto& nb = gfeats[it->second];
-                    road_segments_.push_back({gf.wx, gf.wy, nb.wx, nb.wy, true});
-                    conn = true;
-                }
-            }
-            if (!conn && !has_r(gf.gr, gf.gc - 1) && !has_r(gf.gr - 1, gf.gc) &&
-                !has_r(gf.gr - 1, gf.gc - 1) && !has_r(gf.gr - 1, gf.gc + 1)) {
-                road_segments_.push_back({gf.wx - h, gf.wy, gf.wx + h, gf.wy, true});
-            }
-            continue;
-        }
-
         uint8_t lm = gf.lo_mask;
-        // 1. Exact cardinal half-arms from cell center to edge (0x08=N, 0x01=S, 0x02=E, 0x04=W)
-        if (lm & 0x08u) road_segments_.push_back({gf.wx, gf.wy, gf.wx + h, gf.wy, false});
-        if (lm & 0x01u) road_segments_.push_back({gf.wx, gf.wy, gf.wx - h, gf.wy, false});
-        if (lm & 0x02u) road_segments_.push_back({gf.wx, gf.wy, gf.wx, gf.wy + h, false});
-        if (lm & 0x04u) road_segments_.push_back({gf.wx, gf.wy, gf.wx, gf.wy - h, false});
+        uint8_t hm = gf.hi_mask;
+        uint8_t k = gf.kind;
 
-        // 2. Exact 45-degree straight diagonals (zero stair-stepping!):
+        // 1. Full-cell straight segments (hi_mask 0x01 = W<->E, 0x02 = N<->S)
+        if (hm & 0x01u) road_segments_.push_back({gf.wx, gf.wy - h, gf.wx, gf.wy + h, k});
+        if (hm & 0x02u) road_segments_.push_back({gf.wx - h, gf.wy, gf.wx + h, gf.wy, k});
+
+        // 2. Exact cardinal half-arms from cell center to edge (0x08=N, 0x01=S, 0x02=E, 0x04=W)
+        if (lm & 0x08u) road_segments_.push_back({gf.wx, gf.wy, gf.wx + h, gf.wy, k});
+        if (lm & 0x01u) road_segments_.push_back({gf.wx, gf.wy, gf.wx - h, gf.wy, k});
+        if (lm & 0x02u) road_segments_.push_back({gf.wx, gf.wy, gf.wx, gf.wy + h, k});
+        if (lm & 0x04u) road_segments_.push_back({gf.wx, gf.wy, gf.wx, gf.wy - h, k});
+
+        // 3. Exact 45-degree straight diagonals (zero stair-stepping!):
         //    0x10 = SW->NE diagonal across cell (0x80 is its adjacent SE half-cell clip -> skip if 0x10 neighbor exists)
         if (lm & 0x10u) {
-            road_segments_.push_back({gf.wx - h, gf.wy - h, gf.wx + h, gf.wy + h, false});
+            road_segments_.push_back({gf.wx - h, gf.wy - h, gf.wx + h, gf.wy + h, k});
         } else if (lm & 0x80u) {
             bool has_pair = false;
-            if (auto it = road_grid.find(cell_key(gf.gr, gf.gc - 1)); it != road_grid.end() && (gfeats[it->second].lo_mask & 0x10u)) has_pair = true;
-            if (auto it = road_grid.find(cell_key(gf.gr - 1, gf.gc)); it != road_grid.end() && (gfeats[it->second].lo_mask & 0x10u)) has_pair = true;
-            if (!has_pair) road_segments_.push_back({gf.wx - h, gf.wy - h, gf.wx + h, gf.wy + h, false});
+            if (auto it = feat_grid.find(cell_key(gf.gr, gf.gc - 1)); it != feat_grid.end() && gfeats[it->second].kind == k && (gfeats[it->second].lo_mask & 0x10u)) has_pair = true;
+            if (auto it = feat_grid.find(cell_key(gf.gr - 1, gf.gc)); it != feat_grid.end() && gfeats[it->second].kind == k && (gfeats[it->second].lo_mask & 0x10u)) has_pair = true;
+            if (!has_pair) road_segments_.push_back({gf.wx - h, gf.wy - h, gf.wx + h, gf.wy + h, k});
         }
         //    0x20 = NW->SE diagonal across cell (0x40 is its adjacent SW/NE clip -> skip if 0x20 neighbor exists)
         if (lm & 0x20u) {
-            road_segments_.push_back({gf.wx + h, gf.wy - h, gf.wx - h, gf.wy + h, false});
+            road_segments_.push_back({gf.wx + h, gf.wy - h, gf.wx - h, gf.wy + h, k});
         } else if (lm & 0x40u) {
             bool has_pair = false;
-            if (auto it = road_grid.find(cell_key(gf.gr, gf.gc - 1)); it != road_grid.end() && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
-            if (auto it = road_grid.find(cell_key(gf.gr, gf.gc + 1)); it != road_grid.end() && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
-            if (auto it = road_grid.find(cell_key(gf.gr - 1, gf.gc)); it != road_grid.end() && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
-            if (auto it = road_grid.find(cell_key(gf.gr + 1, gf.gc)); it != road_grid.end() && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
-            if (!has_pair) road_segments_.push_back({gf.wx + h, gf.wy - h, gf.wx - h, gf.wy + h, false});
+            if (auto it = feat_grid.find(cell_key(gf.gr, gf.gc - 1)); it != feat_grid.end() && gfeats[it->second].kind == k && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
+            if (auto it = feat_grid.find(cell_key(gf.gr, gf.gc + 1)); it != feat_grid.end() && gfeats[it->second].kind == k && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
+            if (auto it = feat_grid.find(cell_key(gf.gr - 1, gf.gc)); it != feat_grid.end() && gfeats[it->second].kind == k && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
+            if (auto it = feat_grid.find(cell_key(gf.gr + 1, gf.gc)); it != feat_grid.end() && gfeats[it->second].kind == k && (gfeats[it->second].lo_mask & 0x20u)) has_pair = true;
+            if (!has_pair) road_segments_.push_back({gf.wx + h, gf.wy - h, gf.wx - h, gf.wy + h, k});
         }
     }
+    sync_ils_mapobj_coverage();
     return !map_features_.empty() || !map_structures_.empty();
+}
+
+void ModernRenderer::sync_ils_mapobj_coverage() {
+    for (auto& rw : ils_runways_) {
+        rw.has_mapobj_runway = false;
+        for (const auto& st : map_structures_) {
+            if (st.model_id >= 26 && st.model_id <= 49) {
+                if (std::abs(st.wx - rw.wx) < 8000.0 && std::abs(st.wy - rw.wy) < 8000.0) {
+                    rw.has_mapobj_runway = true;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 bool ModernRenderer::load_ils_runways(const std::string& ils_path) {
@@ -787,15 +796,33 @@ bool ModernRenderer::load_ils_runways(const std::string& ils_path) {
         size_t p = 2 + i * 15;
         int32_t wx = rds32(d, p + 0);
         int32_t wy = rds32(d, p + 4);
-        uint16_t z = rd16(d, p + 8);
-        uint16_t hdg = rd16(d, p + 13);
+        int32_t z = rds32(d, p + 8);
+        // Verified 15-byte ILS.* layout across all 8 theaters:
+        //   +0..+3: i32 wx (North, 0.5 ft), +4..+7: i32 wy (East, 0.5 ft),
+        //   +8..+11: i32 z (elev, 0.5 ft), +12..+13: u16 14-bit BAM heading (0x0000=N, 0x1000=E, 0x2000=S, 0x3000=W), +14: flags
+        uint16_t hdg = rd16(d, p + 12);
+        float hdg_deg = static_cast<float>(hdg & 0x3FFFu) * (360.0f / 16384.0f);
+
+        // Deduplicate padded duplicate slots (e.g. ILS.NEL repeats slot 3 in slots 4..9)
+        bool dup = false;
+        for (const auto& ex : ils_runways_) {
+            if (std::abs(ex.wx - static_cast<double>(wx)) < 10.0 &&
+                std::abs(ex.wy - static_cast<double>(wy)) < 10.0 &&
+                std::abs(ex.heading_deg - hdg_deg) < 0.5f) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+
         IlsRunway rw;
         rw.wx = static_cast<double>(wx);
         rw.wy = static_cast<double>(wy);
         rw.alt_ft = static_cast<float>(z) * 0.5f;
-        rw.heading_deg = static_cast<float>(hdg & 0x3FFFu) * (360.0f / 16384.0f);
+        rw.heading_deg = hdg_deg;
         ils_runways_.push_back(rw);
     }
+    sync_ils_mapobj_coverage();
     return !ils_runways_.empty();
 }
 
@@ -1492,7 +1519,9 @@ void ModernRenderer::draw_alt_terrain(const FlightTelemetry& tel) {
                 double cell_step = kAltTileUnits / 15.0;
                 auto sample_h = [&](int sr, int sc) -> float {
                     uint8_t b = tdata[sr * 16 + sc];
-                    if (b >= 250) return 0.0f;
+                    // All real Falcon 3.0 terrain heights across all 8 theaters are signed 0..119;
+                    // bytes >= 128 (225=0xE1, 236=0xEC, 250=0xFA, 255=0xFF) are flat sea-level / special sentinels!
+                    if (b >= 128) return 0.0f;
                     return static_cast<float>(b) * 0.024f * vr_cfg_.terrain_scale;
                 };
 
@@ -1616,17 +1645,22 @@ void ModernRenderer::draw_roads_and_rivers(const FlightTelemetry& tel) {
         float len = std::sqrt(dx * dx + dz * dz);
         if (len < 1e-5f) continue;
 
-        float w = seg.is_river ? 0.085f : 0.016f; // Sleek ~32m highway ribbon (matches Classic VGA!) vs 170m river
-        float y = seg.is_river ? 0.0225f : 0.0235f;
+        float w = (seg.kind == 1) ? 0.072f : ((seg.kind == 2) ? 0.013f : 0.016f); // Sleek ~32m highway, 144m river, 26m rail/boundary
+        float y = (seg.kind == 1) ? 0.0225f : 0.0235f;
         float px = (-dz / len) * w;
         float pz = ( dx / len) * w;
-        // Slight endcap overlap (0.5*w) prevents micro-cracks at 45-degree corners
+        // Slight endcap overlap (0.55*w) prevents micro-cracks at 45-degree corners
         float ex = (dx / len) * (w * 0.55f);
         float ez = (dz / len) * (w * 0.55f);
 
-        if (seg.is_river) {
+        if (seg.kind == 1) {
+            // Verified hi_mask & 0x40: Real Rivers (Colorado River / Lake Mead, Tigris & Euphrates!)
             glColor3f(0.282f * lit_.water_mul[0], 0.412f * lit_.water_mul[1], 0.808f * lit_.water_mul[2]);
+        } else if (seg.kind == 2) {
+            // Verified hi_mask & 0x80: Railroad / Restricted Range Boundary (subtle dark muted line)
+            glColor3f(0.38f * lit_.ground_mul[0], 0.34f * lit_.ground_mul[1], 0.30f * lit_.ground_mul[2]);
         } else {
+            // Roads & Highways (dark asphalt grey matching 2D Classic VGA!)
             glColor3f(0.32f * lit_.ground_mul[0], 0.30f * lit_.ground_mul[1], 0.29f * lit_.ground_mul[2]);
         }
 
@@ -1655,37 +1689,42 @@ void ModernRenderer::draw_ils_runways(const FlightTelemetry& tel) {
         glTranslatef(x, 0.025f, z);
         glRotatef(-rw.heading_deg, 0.0f, 1.0f, 0.0f);
 
-        // Crisp 2.6 km (8,500 ft) x 55 m (180 ft) concrete military runway
-        constexpr float kLen = 2.60f;
-        constexpr float kHalfW = 0.032f;
-        glColor3f(0.28f * lit_.ground_mul[0], 0.29f * lit_.ground_mul[1], 0.31f * lit_.ground_mul[2]);
-        glBegin(GL_QUADS);
-        glVertex3f(-kHalfW, 0.0f,  0.0f);
-        glVertex3f( kHalfW, 0.0f,  0.0f);
-        glVertex3f( kHalfW, 0.0f, -kLen);
-        glVertex3f(-kHalfW, 0.0f, -kLen);
+        // Exact Falcon 3.0 4-cell runway dimensions: 2.00 km (6,554 ft) x 61 m (200 ft),
+        // with the ILS anchor situated 0.14 km inboard from the approach threshold (+0.14 -> -1.86 km).
+        constexpr float kStartZ =  0.14f;
+        constexpr float kEndZ   = -1.86f;
+        constexpr float kHalfW  =  0.031f;
 
-        // Bright white retro threshold bars & dashed centerline
-        float mark_s = 0.22f + 0.78f * lit_.daylight;
-        glColor3f(0.92f * mark_s, 0.92f * mark_s, 0.90f * mark_s);
-        // Near & far thresholds
-        glVertex3f(-kHalfW * 0.78f, 0.001f, -0.04f);
-        glVertex3f( kHalfW * 0.78f, 0.001f, -0.04f);
-        glVertex3f( kHalfW * 0.78f, 0.001f, -0.10f);
-        glVertex3f(-kHalfW * 0.78f, 0.001f, -0.10f);
+        // Draw fallback synthetic runway slab ONLY if this airbase has no native MAPOBJ 3D runway model (26..49)
+        if (!rw.has_mapobj_runway) {
+            glColor3f(0.28f * lit_.ground_mul[0], 0.29f * lit_.ground_mul[1], 0.31f * lit_.ground_mul[2]);
+            glBegin(GL_QUADS);
+            glVertex3f(-kHalfW, 0.0f, kStartZ);
+            glVertex3f( kHalfW, 0.0f, kStartZ);
+            glVertex3f( kHalfW, 0.0f, kEndZ);
+            glVertex3f(-kHalfW, 0.0f, kEndZ);
 
-        glVertex3f(-kHalfW * 0.78f, 0.001f, -kLen + 0.10f);
-        glVertex3f( kHalfW * 0.78f, 0.001f, -kLen + 0.10f);
-        glVertex3f( kHalfW * 0.78f, 0.001f, -kLen + 0.04f);
-        glVertex3f(-kHalfW * 0.78f, 0.001f, -kLen + 0.04f);
+            // Bright white retro threshold bars & dashed centerline
+            float mark_s = 0.22f + 0.78f * lit_.daylight;
+            glColor3f(0.92f * mark_s, 0.92f * mark_s, 0.90f * mark_s);
+            glVertex3f(-kHalfW * 0.78f, 0.0008f, kStartZ - 0.04f);
+            glVertex3f( kHalfW * 0.78f, 0.0008f, kStartZ - 0.04f);
+            glVertex3f( kHalfW * 0.78f, 0.0008f, kStartZ - 0.10f);
+            glVertex3f(-kHalfW * 0.78f, 0.0008f, kStartZ - 0.10f);
 
-        for (float d = 0.18f; d < kLen - 0.18f; d += 0.16f) {
-            glVertex3f(-0.003f, 0.001f, -d);
-            glVertex3f( 0.003f, 0.001f, -d);
-            glVertex3f( 0.003f, 0.001f, -d - 0.08f);
-            glVertex3f(-0.003f, 0.001f, -d - 0.08f);
+            glVertex3f(-kHalfW * 0.78f, 0.0008f, kEndZ + 0.10f);
+            glVertex3f( kHalfW * 0.78f, 0.0008f, kEndZ + 0.10f);
+            glVertex3f( kHalfW * 0.78f, 0.0008f, kEndZ + 0.04f);
+            glVertex3f(-kHalfW * 0.78f, 0.0008f, kEndZ + 0.04f);
+
+            for (float zc = kStartZ - 0.18f; zc > kEndZ + 0.18f; zc -= 0.16f) {
+                glVertex3f(-0.003f, 0.0008f, zc);
+                glVertex3f( 0.003f, 0.0008f, zc);
+                glVertex3f( 0.003f, 0.0008f, zc - 0.08f);
+                glVertex3f(-0.003f, 0.0008f, zc - 0.08f);
+            }
+            glEnd();
         }
-        glEnd();
 
         // Glowing night / dusk runway edge lights, green approach thresholds & red end-bars!
         if (lit_.night_amount > 0.25f) {
@@ -1696,20 +1735,20 @@ void ModernRenderer::draw_ils_runways(const FlightTelemetry& tel) {
             // Green approach threshold bar
             glColor3f(0.20f * glow, 1.0f * glow, 0.35f * glow);
             for (int k = -3; k <= 3; ++k) {
-                glVertex3f(static_cast<float>(k) * (kHalfW * 0.30f), 0.004f, -0.01f);
+                glVertex3f(static_cast<float>(k) * (kHalfW * 0.30f), 0.004f, kStartZ - 0.01f);
             }
             // Red far end stop bar
             glColor3f(1.0f * glow, 0.18f * glow, 0.15f * glow);
             for (int k = -3; k <= 3; ++k) {
-                glVertex3f(static_cast<float>(k) * (kHalfW * 0.30f), 0.004f, -kLen + 0.01f);
+                glVertex3f(static_cast<float>(k) * (kHalfW * 0.30f), 0.004f, kEndZ + 0.01f);
             }
             // Warm white / amber runway edge lights every 150m
-            for (float d = 0.12f; d < kLen - 0.10f; d += 0.15f) {
-                bool caution = (d > kLen - 0.65f);
+            for (float zc = kStartZ - 0.12f; zc > kEndZ + 0.10f; zc -= 0.15f) {
+                bool caution = (zc < kEndZ + 0.55f);
                 if (caution) glColor3f(1.0f * glow, 0.72f * glow, 0.20f * glow);
                 else         glColor3f(1.0f * glow, 0.96f * glow, 0.84f * glow);
-                glVertex3f(-kHalfW * 1.12f, 0.004f, -d);
-                glVertex3f( kHalfW * 1.12f, 0.004f, -d);
+                glVertex3f(-kHalfW * 1.12f, 0.004f, zc);
+                glVertex3f( kHalfW * 1.12f, 0.004f, zc);
             }
             glEnd();
             glPointSize(1.0f);
@@ -1777,68 +1816,76 @@ void ModernRenderer::draw_ground_structures(const FlightTelemetry& tel) {
 
     glEnable(GL_DEPTH_TEST);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+    float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
 
     for (const auto& st : map_structures_) {
+        if (st.model_id >= mapobj_models_.size() || mapobj_models_[st.model_id].faces.empty()) continue;
+        const ObjModel& mod = mapobj_models_[st.model_id];
         float x = static_cast<float>((st.wy - tel.cam_y) * kHalfFtToKm);
         float z = static_cast<float>(-(st.wx - tel.cam_x) * kHalfFtToKm);
-        if (std::abs(x) > 55.0f || std::abs(z) > 55.0f) continue;
+        float max_r = mod.is_ground_decal ? 70.0f : 55.0f;
+        if (std::abs(x) > max_r || std::abs(z) > max_r) continue;
 
-        float dy = cam_y_km - 0.020f;
+        float base_y = mod.is_ground_decal ? 0.025f : 0.020f;
+        float dy = cam_y_km - base_y;
         float slant_km = std::sqrt(x * x + dy * dy + z * z);
-        float gnd_scale = compute_smart_scale(slant_km, true);
+        // Flat ground decals (runways 26..49, taxiways 103, pads) are ALWAYS strictly 1:1 physical geometry!
+        float gnd_scale = mod.is_ground_decal ? 1.0f : compute_smart_scale(slant_km, true);
+
+        if (mod.is_ground_decal) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-6.0f, -6.0f);
+        }
 
         glPushMatrix();
-        glTranslatef(x, 0.020f, z);
-        glRotatef(-st.yaw_deg, 0.0f, 1.0f, 0.0f);
+        glTranslatef(x, base_y, z);
+        if (std::abs(st.yaw_deg) > 0.01f) {
+            glRotatef(-st.yaw_deg, 0.0f, 1.0f, 0.0f);
+        }
         if (gnd_scale > 1.001f) {
             glScalef(gnd_scale, gnd_scale, gnd_scale);
         }
 
-        if (st.model_id < mapobj_models_.size() && !mapobj_models_[st.model_id].faces.empty()) {
-            const ObjModel& mod = mapobj_models_[st.model_id];
-            for (const auto& face : mod.faces) {
-                if (face.verts.size() < 3) continue;
-                float shade = 0.65f + 0.35f * std::abs(face.normal.x * 0.42f + face.normal.y * 0.80f + face.normal.z * 0.42f);
-                float r = 0.58f, g = 0.55f, b = 0.50f;
-                if (has_vga_pal_ && face.color_idx != 0) {
-                    r = vga_rgb_[face.color_idx * 3 + 0];
-                    g = vga_rgb_[face.color_idx * 3 + 1];
-                    b = vga_rgb_[face.color_idx * 3 + 2];
-                    if (r + g + b < 0.15f) { r = 0.44f * lit_.daylight; g = 0.42f * lit_.daylight; b = 0.38f * lit_.daylight; }
-                    // When user forces Dusk/Night override while Falcon is in daytime, tint model colors too!
-                    if (vr_cfg_.lighting_mode != LightingMode::AutoFromFalcon) {
-                        r *= lit_.ground_mul[0]; g *= lit_.ground_mul[1]; b *= lit_.ground_mul[2];
-                    }
-                } else {
+        for (const auto& face : mod.faces) {
+            if (face.verts.size() < 3) continue;
+            // For coplanar runway/decal markings (painted numbers & threshold stripes in group 1+, color_idx 122),
+            // lift cleanly above the concrete slab so there is zero Z-fighting at any altitude!
+            float face_y_lift = 0.0f;
+            if (mod.is_ground_decal && (face.layer_idx > 0 || face.color_idx == 122)) {
+                face_y_lift = 0.0005f + 0.0002f * static_cast<float>(std::min<uint8_t>(face.layer_idx, 4));
+            }
+            float shade = mod.is_ground_decal
+                ? 0.95f
+                : (0.65f + 0.35f * std::abs(face.normal.x * 0.42f + face.normal.y * 0.80f + face.normal.z * 0.42f));
+            float r = 0.58f, g = 0.55f, b = 0.50f;
+            if (has_vga_pal_ && face.color_idx != 0) {
+                r = vga_rgb_[face.color_idx * 3 + 0];
+                g = vga_rgb_[face.color_idx * 3 + 1];
+                b = vga_rgb_[face.color_idx * 3 + 2];
+                if (r + g + b < 0.15f) { r = 0.44f * lit_.daylight; g = 0.42f * lit_.daylight; b = 0.38f * lit_.daylight; }
+                // When user forces Dusk/Night override while Falcon is in daytime, tint model colors too!
+                if (vr_cfg_.lighting_mode != LightingMode::AutoFromFalcon) {
                     r *= lit_.ground_mul[0]; g *= lit_.ground_mul[1]; b *= lit_.ground_mul[2];
                 }
-                glColor3f(std::min(1.0f, r * shade), std::min(1.0f, g * shade), std::min(1.0f, b * shade));
-                glBegin(GL_POLYGON);
-                for (uint16_t vi : face.verts) {
-                    const ObjVec3& v = mod.verts[vi];
-                    glVertex3f(v.x, v.y, v.z);
-                }
-                glEnd();
+            } else {
+                r *= lit_.ground_mul[0]; g *= lit_.ground_mul[1]; b *= lit_.ground_mul[2];
             }
-        } else {
-            // Crisp fallback retro hangar/building box if model has no LOD0 faces
-            constexpr float hw = 0.030f, hh = 0.018f;
-            glBegin(GL_QUADS);
-            glColor3f(0.56f * lit_.ground_mul[0], 0.54f * lit_.ground_mul[1], 0.50f * lit_.ground_mul[2]);
-            glVertex3f(-hw, hh, -hw); glVertex3f(hw, hh, -hw); glVertex3f(hw, hh, hw); glVertex3f(-hw, hh, hw);
-            glColor3f(0.46f * lit_.ground_mul[0], 0.44f * lit_.ground_mul[1], 0.40f * lit_.ground_mul[2]);
-            glVertex3f(-hw, 0, hw); glVertex3f(hw, 0, hw); glVertex3f(hw, hh, hw); glVertex3f(-hw, hh, hw);
-            glVertex3f(-hw, 0, -hw); glVertex3f(hw, 0, -hw); glVertex3f(hw, hh, -hw); glVertex3f(-hw, hh, -hw);
-            glColor3f(0.38f * lit_.ground_mul[0], 0.36f * lit_.ground_mul[1], 0.33f * lit_.ground_mul[2]);
-            glVertex3f(hw, 0, -hw); glVertex3f(hw, 0, hw); glVertex3f(hw, hh, hw); glVertex3f(hw, hh, -hw);
-            glVertex3f(-hw, 0, -hw); glVertex3f(-hw, 0, hw); glVertex3f(-hw, hh, hw); glVertex3f(-hw, hh, -hw);
+            glColor3f(std::min(1.0f, r * shade), std::min(1.0f, g * shade), std::min(1.0f, b * shade));
+            glBegin(GL_POLYGON);
+            for (uint16_t vi : face.verts) {
+                const ObjVec3& v = mod.verts[vi];
+                glVertex3f(v.x, v.y + face_y_lift, v.z);
+            }
             glEnd();
         }
         glPopMatrix();
+
+        if (mod.is_ground_decal) {
+            glDisable(GL_POLYGON_OFFSET_FILL);
+        }
     }
 
-    // Subtle warm city & facility lights across Kuwait City / Basra / airbases at night!
+    // Subtle warm city & facility lights across Kuwait City / Basra / Las Vegas / airbases at night!
     if (lit_.night_amount > 0.30f) {
         float glow = std::clamp((lit_.night_amount - 0.30f) / 0.50f, 0.0f, 1.0f);
         glDisable(GL_FOG);
@@ -1848,6 +1895,7 @@ void ModernRenderer::draw_ground_structures(const FlightTelemetry& tel) {
         glBegin(GL_POINTS);
         for (size_t i = 0; i < map_structures_.size(); ++i) {
             const auto& st = map_structures_[i];
+            if (st.model_id < mapobj_models_.size() && mapobj_models_[st.model_id].is_ground_decal) continue;
             float x = static_cast<float>((st.wy - tel.cam_y) * kHalfFtToKm);
             float z = static_cast<float>(-(st.wx - tel.cam_x) * kHalfFtToKm);
             if (std::abs(x) > 48.0f || std::abs(z) > 48.0f) continue;
@@ -1863,68 +1911,73 @@ void ModernRenderer::draw_ground_structures(const FlightTelemetry& tel) {
 }
 
 void ModernRenderer::draw_clouds(const FlightTelemetry& tel) {
-    if (!vr_cfg_.show_clouds || cloud_grid_.size() != 128 * 128) return;
+    if (!vr_cfg_.show_clouds) return;
 
-    constexpr double kCloudCellUnits = (2.0 * kTheaterHalfSpan) / 128.0; // 52,400 units = 7.98 km
-    constexpr float kCloudAltKm = 4.25f; // ~14,000 ft MSL
+    // Sparse, world-locked, organically jittered retro flat clouds matching Classic 2D Falcon 3.0!
+    // (Note: ALT.*[0..4095] is a coarse terrain/mountain-basin mask covering 29% of Nevada in a contiguous
+    //  block — NOT a cloud grid — which previously created an unnatural ceiling-tile grid of rectangles!)
+    constexpr double kCellKm = 13.5;
+    constexpr double kCellUnits = kCellKm / kHalfFtToKm;
+    constexpr int kRadiusCells = 9; // ~120 km horizon reach
 
-    int pc = static_cast<int>((tel.cam_y + kTheaterHalfSpan) / kCloudCellUnits);
-    int pr = static_cast<int>((kTheaterHalfSpan - tel.cam_x) / kCloudCellUnits);
-    int r0 = std::max(0, pr - 16);
-    int r1 = std::min(127, pr + 16);
-    int c0 = std::max(0, pc - 16);
-    int c1 = std::min(127, pc + 16);
+    int64_t pc = static_cast<int64_t>(std::floor(tel.cam_y / kCellUnits));
+    int64_t pr = static_cast<int64_t>(std::floor(tel.cam_x / kCellUnits));
 
-    glEnable(GL_DEPTH_TEST);
-
-    // 1. Crisp retro cloud ground shadows projected onto the Kuwaiti desert floor (fade cleanly at night!)
-    float sun_sh = std::clamp((lit_.daylight - 0.28f) / 0.50f, 0.0f, 1.0f);
-    if (vr_cfg_.ground_shadows && sun_sh > 0.02f) {
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glColor4f(0.32f * lit_.ground_mul[0], 0.27f * lit_.ground_mul[1], 0.22f * lit_.ground_mul[2], 0.14f * sun_sh);
-        glBegin(GL_QUADS);
-        for (int r = r0; r <= r1; ++r) {
-            double wx = kTheaterHalfSpan - (static_cast<double>(r) + 0.5) * kCloudCellUnits;
-            float cz = static_cast<float>(-(wx - tel.cam_x) * kHalfFtToKm) + 0.45f;
-            for (int c = c0; c <= c1; ++c) {
-                uint8_t dens = cloud_grid_[r * 128 + c];
-                if (dens == 0) continue;
-                double wy = -kTheaterHalfSpan + (static_cast<double>(c) + 0.5) * kCloudCellUnits;
-                if (is_alt_water_at(wx, wy)) continue;
-                float cx = static_cast<float>((wy - tel.cam_y) * kHalfFtToKm) + 0.60f;
-                float hw = 1.5f + 0.65f * static_cast<float>(dens);
-                float hd = 1.0f + 0.45f * static_cast<float>(dens);
-                glVertex3f(cx - hw, 0.019f, cz - hd);
-                glVertex3f(cx + hw, 0.019f, cz - hd);
-                glVertex3f(cx + hw, 0.019f, cz + hd);
-                glVertex3f(cx - hw, 0.019f, cz + hd);
-            }
+    auto draw_cloud_poly = [](float cx, float y, float cz, float rx, float rz, float yaw, int64_t gx, int64_t gz) {
+        constexpr int kSides = 10;
+        float ca = std::cos(yaw), sa = std::sin(yaw);
+        glBegin(GL_POLYGON);
+        for (int k = 0; k < kSides; ++k) {
+            float ang = (static_cast<float>(k) / static_cast<float>(kSides)) * 2.0f * kPi;
+            // Deterministic organic lobe variation per vertex so every cloud has a unique retro silhouette
+            float lobe = 0.78f + 0.34f * hash2f(gx * 13 + k, gz * 17 + k, 881);
+            float lx = std::cos(ang) * rx * lobe;
+            float lz = std::sin(ang) * rz * lobe;
+            float wx = cx + lx * ca - lz * sa;
+            float wz = cz + lx * sa + lz * ca;
+            glVertex3f(wx, y, wz);
         }
         glEnd();
-        glDisable(GL_BLEND);
-    }
+    };
 
-    // 2. Retro flat 3D cloud polygons (matches live Falcon VGA cloud color idx 176: bright white by day, dark indigo at night!)
-    glColor3fv(lit_.cloud_rgb);
-    glBegin(GL_QUADS);
-    for (int r = r0; r <= r1; ++r) {
-        double wx = kTheaterHalfSpan - (static_cast<double>(r) + 0.5) * kCloudCellUnits;
-        float cz = static_cast<float>(-(wx - tel.cam_x) * kHalfFtToKm);
-        for (int c = c0; c <= c1; ++c) {
-            uint8_t dens = cloud_grid_[r * 128 + c];
-            if (dens == 0) continue;
-            double wy = -kTheaterHalfSpan + (static_cast<double>(c) + 0.5) * kCloudCellUnits;
+    glEnable(GL_DEPTH_TEST);
+    float sun_sh = std::clamp((lit_.daylight - 0.28f) / 0.50f, 0.0f, 1.0f);
+
+    for (int64_t gr = pr - kRadiusCells; gr <= pr + kRadiusCells; ++gr) {
+        for (int64_t gc = pc - kRadiusCells; gc <= pc + kRadiusCells; ++gc) {
+            // Sparse ~16% natural coverage -> 1..4 scattered clouds visible at once, zero grid pattern!
+            if (hash2f(gr, gc, 101) > 0.16f) continue;
+
+            // Strong random jitter (+/- 42% of cell size) breaks all row/column alignment completely
+            double jx = (static_cast<double>(hash2f(gr, gc, 211)) - 0.5) * 0.84 * kCellUnits;
+            double jy = (static_cast<double>(hash2f(gr, gc, 307)) - 0.5) * 0.84 * kCellUnits;
+            double wx = (static_cast<double>(gr) + 0.5) * kCellUnits + jx;
+            double wy = (static_cast<double>(gc) + 0.5) * kCellUnits + jy;
+
             float cx = static_cast<float>((wy - tel.cam_y) * kHalfFtToKm);
-            float hw = 1.6f + 0.7f * static_cast<float>(dens);
-            float hd = 1.1f + 0.5f * static_cast<float>(dens);
-            glVertex3f(cx - hw, kCloudAltKm, cz - hd);
-            glVertex3f(cx + hw, kCloudAltKm, cz - hd);
-            glVertex3f(cx + hw, kCloudAltKm, cz + hd);
-            glVertex3f(cx - hw, kCloudAltKm, cz + hd);
+            float cz = static_cast<float>(-(wx - tel.cam_x) * kHalfFtToKm);
+            float dist_sq = cx * cx + cz * cz;
+            if (dist_sq > 118.0f * 118.0f) continue;
+
+            float rx  = 1.25f + 1.65f * hash2f(gr, gc, 401);
+            float rz  = rx * (0.58f + 0.48f * hash2f(gr, gc, 509));
+            float yaw = hash2f(gr, gc, 607) * 2.0f * kPi;
+            float alt = 3.85f + 0.95f * hash2f(gr, gc, 701); // 12,600 .. 15,750 ft MSL
+
+            // 1. Subtle matching rounded ground shadow on desert/land (skip over open water)
+            if (vr_cfg_.ground_shadows && sun_sh > 0.02f && dist_sq < 65.0f * 65.0f && !is_alt_water_at(wx, wy)) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glColor4f(0.32f * lit_.ground_mul[0], 0.27f * lit_.ground_mul[1], 0.22f * lit_.ground_mul[2], 0.13f * sun_sh);
+                draw_cloud_poly(cx + 0.60f, 0.019f, cz + 0.45f, rx * 0.92f, rz * 0.92f, yaw, gr, gc);
+                glDisable(GL_BLEND);
+            }
+
+            // 2. Crisp retro flat multi-sided cloud polygon (live VGA cloud color idx 176: cream-white by day, indigo at night)
+            glColor3fv(lit_.cloud_rgb);
+            draw_cloud_poly(cx, alt, cz, rx, rz, yaw, gr, gc);
         }
     }
-    glEnd();
 }
 
 void ModernRenderer::draw_world_entities(const FlightTelemetry& tel) {
@@ -1944,7 +1997,7 @@ void ModernRenderer::draw_world_entities(const FlightTelemetry& tel) {
         // In External Chase ('2') view, Falcon updates player slot 0 (0x43AB4) slightly asynchronously from
         // camera (0x45C10), causing 1-tick back-and-forth jitter; filter player relative offset smoothly!
         if (ent.is_player && tel.is_external_cam) {
-            float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+            float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
             float ey_rel = ey - cam_y_km;
             float dx = ex - smooth_chase_ex_;
             float dy = ey_rel - smooth_chase_ey_;
@@ -1968,7 +2021,7 @@ void ModernRenderer::draw_world_entities(const FlightTelemetry& tel) {
 
         float dist_sq = ex * ex + ez * ez;
         if (dist_sq > 85.0f * 85.0f) continue;
-        float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+        float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
         float dy = ey - cam_y_km;
         float dist_km = std::sqrt(dist_sq);
         float slant_km = std::sqrt(dist_sq + dy * dy);
@@ -2058,7 +2111,7 @@ void ModernRenderer::draw_ground_units(const FlightTelemetry& tel) {
     glEnable(GL_DEPTH_TEST);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
-    float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+    float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
 
     for (const auto& g : tel.ground_units) {
         float gx = static_cast<float>((g.world_y - tel.cam_y) * kHalfFtToKm);
@@ -2372,7 +2425,7 @@ void ModernRenderer::update_explosions_and_contrails(const FlightTelemetry& tel,
 void ModernRenderer::draw_contrails(const FlightTelemetry& tel) {
     if (!vr_cfg_.show_contrails || contrails_.empty()) return;
 
-    float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+    float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
     float yaw_r = tel.cam_yaw_deg * kDeg2Rad;
     float pitch_r = tel.cam_pitch_deg * kDeg2Rad;
     float right_x = std::cos(yaw_r);
@@ -2425,7 +2478,7 @@ void ModernRenderer::draw_contrails(const FlightTelemetry& tel) {
 void ModernRenderer::draw_explosions(const FlightTelemetry& tel) {
     if (!vr_cfg_.show_explosions || explosions_.empty()) return;
 
-    float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+    float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
 
     auto draw_octa = [](float cx, float cy, float cz, float rx, float ry, float rz) {
         // Crisp 8-face retro low-poly octahedron (matches Falcon 3.0's classic faceted explosions!)
@@ -2512,7 +2565,7 @@ void ModernRenderer::draw_missiles_and_trails(const FlightTelemetry& tel) {
     if (!vr_cfg_.show_missiles_trails) return;
     if (tel.missiles.empty() && missile_trails_.empty()) return;
 
-    float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+    float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
     // Camera right & up vectors in world space for crisp long-range rocket flares & smoke billboards
     float yaw_r = tel.cam_yaw_deg * kDeg2Rad;
     float pitch_r = tel.cam_pitch_deg * kDeg2Rad;
@@ -2944,7 +2997,7 @@ void ModernRenderer::render_3d_view(int x, int y, int w, int h, const FlightTele
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    float cam_y_km = std::max(0.020f, tel.cam_alt_ft * 0.0003048f);
+    float cam_y_km = std::max(0.029f, tel.cam_alt_ft * 0.0003048f);
 
     glRotatef(roll, 0.0f, 0.0f, 1.0f);
     glRotatef(-pitch, 1.0f, 0.0f, 0.0f);
@@ -3118,7 +3171,7 @@ void ModernRenderer::draw_padlock_xray_box(int x, int y, int w, int h, const Fli
     if (!tel.padlock_active || !tel.padlock_has_target || w <= 0 || h <= 0) return;
 
     // 1. Target relative vector in OpenGL world space (+X East, +Y Up, -Z North)
-    float cam_y_km = std::max(0.020f, tel.altitude_ft * 0.0003048f);
+    float cam_y_km = std::max(0.029f, tel.altitude_ft * 0.0003048f);
     float wx = static_cast<float>((tel.padlock_target_y - tel.world_y) * kHalfFtToKm);
     float wy = static_cast<float>(tel.padlock_target_z * kHalfFtToKm) - cam_y_km;
     float wz = static_cast<float>(-(tel.padlock_target_x - tel.world_x) * kHalfFtToKm);
@@ -3480,7 +3533,7 @@ void ModernRenderer::draw_native_padlock_strip(int px, int py, int pw, int ph, c
     int box_cx = 160, box_cy = 24;
     bool target_below_sill = false;
     if (tel.padlock_has_target) {
-        float cam_y_km = std::max(0.020f, tel.altitude_ft * 0.0003048f);
+        float cam_y_km = std::max(0.029f, tel.altitude_ft * 0.0003048f);
         float wx = static_cast<float>((tel.padlock_target_y - tel.world_y) * kHalfFtToKm);
         float wy = static_cast<float>(tel.padlock_target_z * kHalfFtToKm) - cam_y_km;
         float wz = static_cast<float>(-(tel.padlock_target_x - tel.world_x) * kHalfFtToKm);
@@ -3628,16 +3681,17 @@ void ModernRenderer::render_frame(int win_w, int win_h, GLuint vga_tex, GLuint v
     }
 
     // Detect enhanced Unclamped 3D Padlock (8) vs Free-Look 3D Virtual Cockpit vs Standard Views!
+    // Lock is_forward_cockpit directly to RAM view_mode == 0 (never depend on world_y_min pixel-counting,
+    // which can flicker on overcast skies, radio text overlays, or VGA page flips!)
     bool use_3d_padlock = (tel.padlock_active && vr_cfg_.enhanced_3d_padlock);
-    bool is_forward_cockpit = (!tel.is_external_cam && tel.view_mode == 0 &&
-                               tel.world_y_min <= 12 && tel.world_y_max <= 112);
+    bool is_forward_cockpit = (!tel.is_external_cam && tel.view_mode == 0);
     bool is_freelook_active = (is_forward_cockpit && vr_cfg_.virtual_cockpit_freelook &&
                                (std::abs(vr_cfg_.head_yaw_deg) > 0.5f || std::abs(vr_cfg_.head_pitch_deg) > 0.5f));
 
     // Prepare unclamped 3D Padlock camera telemetry when in Padlock View (8)!
     FlightTelemetry active_tel = tel;
     if (use_3d_padlock && tel.padlock_has_target) {
-        float cam_y_km = std::max(0.020f, tel.altitude_ft * 0.0003048f);
+        float cam_y_km = std::max(0.029f, tel.altitude_ft * 0.0003048f);
         float dx = static_cast<float>((tel.padlock_target_y - tel.world_y) * kHalfFtToKm);
         float dy = static_cast<float>(tel.padlock_target_z * kHalfFtToKm) - cam_y_km;
         float dz = static_cast<float>(-(tel.padlock_target_x - tel.world_x) * kHalfFtToKm);

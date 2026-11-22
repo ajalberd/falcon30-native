@@ -11,7 +11,7 @@ A standalone C++20 native host (SDL3 + OpenGL + Dear ImGui + Munt `libmt32emu` +
 ### After — Native Host (Hybrid HD 3D Widescreen)
 60+ FPS OpenGL 3D world, 14-band live `ALTPAL` sunset, faceted desert, coastline & 3D buildings, with Falcon's real 2D HUD, MFD & RWR locked 1:1:
 
-![Hybrid HD 3D Widescreen](docs/screenshots/after_hybrid_hd_widescreen.jpg)
+![Hybrid HD 3D Widescreen](docs/screenshots/after_hybrid_hd_widescreen.png)
 
 ### Before — Classic 1991 VGA (`320×200`, 4:3)
 Original 4:3 DOS software renderer:

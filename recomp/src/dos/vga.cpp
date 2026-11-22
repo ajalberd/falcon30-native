@@ -321,19 +321,22 @@ void VgaDevice::render_overlay_layers_200(uint32_t* out_cockpit_rgba, uint32_t* 
             uint32_t b = (dac_[idx * 3 + 2] * 255) / 63;
             uint32_t rgba = 0xFF000000u | (b << 16) | (g << 8) | r;
 
-            // Verified Falcon 3.0 VGA palette layout across ALL views (Forward Cockpit, Side/Rear, Padlock, Chase/External):
-            //  - idx 0..127   = Cockpit metal frame, canopy bow, HUD struts, MFD, RWR, gauges, Padlock/Chase status bars, & HUD green (idx 56)
-            //  - idx 128..255 = Out-the-window 3D world (sky, haze, water, desert, clouds, 3D aircraft)
+            // Verified Falcon 3.0 VGA palette layout from VGRAPH @ 0x4F3:
+            //  - idx 128..255 = Pure out-the-window 3D world (sky, haze, water, desert, clouds) — used for rock-solid world_y_min/max!
+            //  - idx 116..127 = 3D world greyscale/camo ramp (runway numbers idx 122, building roofs, trees).
+            //    Strip 116..127 in the windshield region (y < 102) so 2D VGA runway numbers never bleed onto the glass,
+            //    while keeping y >= 102 (dashboard/gauges) at idx < 128 so zero instrument pixels are punched out!
             if (idx >= 128) {
                 world_px_in_row++;
             }
             if (dst_cockpit) {
-                dst_cockpit[x] = (idx < 128) ? rgba : 0x00000000u;
+                bool is_cockpit_px = (y < 102) ? (idx < 116) : (idx < 128);
+                dst_cockpit[x] = is_cockpit_px ? rgba : 0x00000000u;
             }
             if (dst_hud) {
                 // Dedicated HUD green index (56) or bright HUD green/amber inside the HUD glass region
                 bool in_hud_glass = (y < 103 && x >= 76 && x <= 244);
-                bool is_hud_pixel = in_hud_glass && ((idx == 56) || (idx < 128 && g >= 180 && r <= 90 && b <= 110));
+                bool is_hud_pixel = in_hud_glass && ((idx == 56) || (idx < 116 && g >= 180 && r <= 90 && b <= 110));
                 dst_hud[x] = is_hud_pixel ? rgba : 0x00000000u;
             }
         }

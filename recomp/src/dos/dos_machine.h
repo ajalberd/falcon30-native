@@ -297,6 +297,8 @@ private:
     mutable int padlock_sticky_slot_ = -1;
     mutable char padlock_sticky_name_[16]{};
     std::string detected_theater_ext_;
+    bool in_3d_flight_session_ = false;
+    double disk_turbo_sec_ = 0.0; // Temporary 25-MIPS burst during mission/theater/overlay disk loads
     std::deque<std::string> log_lines_;
 
     void log(const std::string& msg);

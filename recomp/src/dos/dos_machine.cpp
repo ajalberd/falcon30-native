@@ -1102,9 +1102,19 @@ void DosMachine::int_21h() {
                 emu_->x86.R_AX = h;
                 log("DOS OPEN OK: " + dos_name + " -> h=" + std::to_string(h));
 
-                // Auto-detect active theater whenever Falcon opens ALT.*, ISLDAT.*, MAPOBJ.*, or ILS.*!
+                // Auto-detect active theater & 3D flight session state from DOS file opens!
                 {
                     std::string uname = to_upper(dos_name);
+                    // Only clear 3D session on true menu/debrief screens (NOT SQUAD*.SQU, which Campaign reads when entering flight!)
+                    if (uname.find("WARROOM") != std::string::npos ||
+                        uname.find("DEBRIEF") != std::string::npos ||
+                        uname.find("BARROOM") != std::string::npos ||
+                        uname.find("TITLE") != std::string::npos ||
+                        uname.find("MONITOR.IDX") != std::string::npos) {
+                        in_3d_flight_session_ = false;
+                    } else if (uname.find("COCKPIT") != std::string::npos) {
+                        in_3d_flight_session_ = true;
+                    }
                     size_t dot = uname.rfind('.');
                     if (dot != std::string::npos && dot + 4 == uname.size()) {
                         std::string ext = uname.substr(dot + 1, 3);
@@ -1115,11 +1125,23 @@ void DosMachine::int_21h() {
                              uname.find("ISLDAT.") != std::string::npos ||
                              uname.find("MAPOBJ.") != std::string::npos ||
                              uname.find("ILS.") != std::string::npos)) {
+                            in_3d_flight_session_ = true;
                             if (detected_theater_ext_ != ext) {
                                 detected_theater_ext_ = ext;
                                 log("AUTO-DETECTED THEATER: " + ext);
                             }
                         }
+                    }
+                    // Trigger a brief 25-MIPS Disk/Mission Load Turbo burst when loading missions (.RFM/.CMP),
+                    // theater maps, overlays, or UI screens (skip audio/cutscene streams so music/intros stay normal speed!)
+                    bool is_media_stream = (uname.find(".VOX") != std::string::npos ||
+                                            uname.find(".SNG") != std::string::npos ||
+                                            uname.find(".MT")  != std::string::npos ||
+                                            uname.find(".AD")  != std::string::npos ||
+                                            uname.find("INTRO") != std::string::npos ||
+                                            uname.find("CREDITS") != std::string::npos);
+                    if (!is_media_stream) {
+                        disk_turbo_sec_ = std::max(disk_turbo_sec_, 0.55);
                     }
                 }
 
@@ -1196,6 +1218,14 @@ void DosMachine::int_21h() {
                             apply_sam_mod_in_ram();
                         }
                     }
+                }
+            }
+            // Sustain 25-MIPS Disk/Mission Load Turbo during sustained non-audio file reads (mission/map/overlay loading!)
+            if (got >= 512) {
+                std::string up = to_upper(it->second->host_path);
+                if (up.find(".VOX") == std::string::npos && up.find(".SNG") == std::string::npos &&
+                    up.find(".MT")  == std::string::npos && up.find("INTRO") == std::string::npos) {
+                    disk_turbo_sec_ = std::max(disk_turbo_sec_, 0.45);
                 }
             }
             emu_->x86.R_AX = static_cast<uint16_t>(got);
@@ -1738,12 +1768,27 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
 
     uint16_t mach100 = rd_u16(0x47376);
     uint16_t kias = rd_u16(0x47378);
+    uint16_t rpm = rd_u16(0x4737C);
     uint16_t alt_msl4 = rd_u16(0x473A2);
     uint16_t alt_agl4 = rd_u16(0x473A4);
     uint16_t z_half_ft = rd_u16(0x4736C);
 
-    // Heuristic: in flight if airspeed/altitude are in plausible flight range
-    if (kias > 10 && kias < 1800 && alt_msl4 < 25000) {
+    // Detect active 3D flight BOTH airborne (kias > 10) AND sitting at 0..10 kts on the runway / zoom-in
+    // in Campaign / Red Flag / Training missions (so Hybrid Mode & 20-MIPS Auto-Turbo engage immediately!)
+    int32_t cam_x0 = rd_i32(0x45C10);
+    int32_t cam_y0 = rd_i32(0x45C14);
+    int32_t pos_x0 = rd_i32(0x47364);
+    int32_t pos_y0 = rd_i32(0x47368);
+    bool has_valid_cam0 = (cam_x0 != 0 || cam_y0 != 0) &&
+                          std::abs(cam_x0) < 10000000 && std::abs(cam_y0) < 10000000;
+    bool has_valid_pos0 = (pos_x0 != 0 || pos_y0 != 0) &&
+                          std::abs(pos_x0) < 10000000 && std::abs(pos_y0) < 10000000;
+    bool airborne = (kias > 10 && kias < 1800 && alt_msl4 < 25000);
+    bool on_runway_3d = (in_3d_flight_session_ && has_valid_cam0 && has_valid_pos0 &&
+                         kias < 1800 && alt_msl4 < 25000);
+    (void)rpm;
+
+    if (airborne || on_runway_3d) {
         t.in_flight = true;
         t.world_x = static_cast<double>(rd_i32(0x47364));
         t.world_y = static_cast<double>(rd_i32(0x47368));
@@ -1770,11 +1815,33 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
         t.mach = static_cast<float>(mach100) * 0.01f;
         t.g_load = std::clamp(static_cast<float>(rd_i16(0x47432)) * 0.1f, -4.0f, 12.0f);
 
-        // Read Falcon 3.0's active 3D camera state @ 0x45C10 (tracks Forward Cockpit, Side/Rear, Padlock, Chase, Orbit, Flyby, Enemy!)
+        // Read active Falcon 3.0 View Mode @ 0x13E28 BEFORE resolving camera so Forward Cockpit (0) never flickers!
+        // (0=Fwd, 2=Left, 4=Right, 6=Rear, 18=External/Chase/Flyby, 26=Padlock)
+        t.view_mode = rd_u16(0x13E28);
+        t.padlock_active = (t.view_mode == 26);
+
+        // Read Falcon 3.0's active 3D camera state @ 0x45C10 (tracks Side/Rear, Padlock, Chase, Orbit, Flyby, Enemy!)
         int32_t cx = rd_i32(0x45C10);
         int32_t cy = rd_i32(0x45C14);
         int32_t cz = rd_i32(0x45C18);
-        if ((cx != 0 || cy != 0) && std::abs(cx) < 10000000 && std::abs(cy) < 10000000 && cz >= 0 && cz < 200000) {
+        bool valid_cam = (cx != 0 || cy != 0) && std::abs(cx) < 10000000 && std::abs(cy) < 10000000 && cz >= 0 && cz < 200000;
+        double dcz = valid_cam ? std::abs(static_cast<double>(cz) - static_cast<double>(z_half_ft)) : 0.0;
+        bool is_cockpit_view = (t.view_mode == 0 || t.view_mode == 2 || t.view_mode == 4 || t.view_mode == 6 || t.view_mode == 26);
+
+        if (t.view_mode == 0 && (!valid_cam || dcz < 250.0)) {
+            // In Forward Cockpit (view_mode == 0, excluding high-altitude Campaign zoom-in where dcz >= 250),
+            // lock directly to the atomic player aircraft state (0x47364..0x47374)!
+            // Prevents 1-tick async lag (|C - P| > 120 half-ft at 400+ kts) and scratch overwrites of 0x45C10 from
+            // causing vertical view / external-camera flicker!
+            t.has_camera = true;
+            t.cam_x = t.world_x;
+            t.cam_y = t.world_y;
+            t.cam_alt_ft = t.altitude_ft;
+            t.cam_yaw_deg = t.yaw_deg;
+            t.cam_pitch_deg = t.pitch_deg;
+            t.cam_roll_deg = t.roll_deg;
+            t.is_external_cam = false;
+        } else if (valid_cam) {
             t.has_camera = true;
             t.cam_x = static_cast<double>(cx);
             t.cam_y = static_cast<double>(cy);
@@ -1785,10 +1852,9 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
 
             double dcx = t.cam_x - t.world_x;
             double dcy = t.cam_y - t.world_y;
-            double dcz = static_cast<double>(cz) - static_cast<double>(z_half_ft);
             double cam_dist = std::sqrt(dcx * dcx + dcy * dcy + dcz * dcz);
-            // Chase cam is ~150..620 half-feet behind jet; forward cockpit is <= 80 half-feet
-            t.is_external_cam = (cam_dist > 120.0);
+            // Inside-cockpit views (2/4/6/26) are never external; external views (18) or Campaign zoom-in (dcz >= 250) are external
+            t.is_external_cam = is_cockpit_view ? (dcz >= 250.0) : (cam_dist > 120.0 || t.view_mode == 18);
         } else {
             t.cam_x = t.world_x;
             t.cam_y = t.world_y;
@@ -1885,10 +1951,7 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
             t.missiles.push_back(m);
         }
 
-        // 4. Read active Falcon 3.0 View Mode (0x13E28: 0=Fwd, 2=Left, 4=Right, 6=Rear, 18=External, 26=Padlock)
-        //    and resolve the EXACT unclamped 3D Padlock target (aircraft OR incoming SAM/AAM)!
-        t.view_mode = rd_u16(0x13E28);
-        t.padlock_active = (t.view_mode == 26);
+        // 4. Resolve the EXACT unclamped 3D Padlock target (aircraft OR incoming SAM/AAM) when in Padlock view (26)!
         if (t.padlock_active) {
             // Read ASCII target name @ 0x46228 ("SU25", "MIG29", "SAM", "AIM-9", "MISSILE", etc.)
             int nlen = 0;
@@ -2433,8 +2496,13 @@ uint64_t DosMachine::step(uint64_t max_instructions) {
 }
 
 uint64_t DosMachine::effective_cpu_speed_ips() const {
-    if (auto_turbo_in_flight_ && read_flight_telemetry().in_flight) {
-        return flight_cpu_speed_ips_;
+    if (auto_turbo_in_flight_) {
+        if (disk_turbo_sec_ > 0.0) {
+            return std::max<uint64_t>(flight_cpu_speed_ips_, 25000000ULL);
+        }
+        if (in_3d_flight_session_ || read_flight_telemetry().in_flight) {
+            return flight_cpu_speed_ips_;
+        }
     }
     return cpu_speed_ips_;
 }
@@ -2484,6 +2552,9 @@ uint64_t DosMachine::step_realtime(double dt_sec) {
     }
 
     dt_sec = std::clamp(dt_sec, 0.0, 0.05); // Cap dt at 50ms on lag spikes
+    if (disk_turbo_sec_ > 0.0) {
+        disk_turbo_sec_ = std::max(0.0, disk_turbo_sec_ - dt_sec);
+    }
     auto wall_start = std::chrono::steady_clock::now();
 
     poll_ipx_udp();
