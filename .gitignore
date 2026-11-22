@@ -40,6 +40,8 @@ falcon3_hotas.json
 *.ppm
 *.png
 *.jpg
+!docs/screenshots/*.png
+!docs/screenshots/*.jpg
 *.ram
 *.log
 *.lnk
