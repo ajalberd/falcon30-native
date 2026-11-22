@@ -8,10 +8,15 @@ A standalone C++20 native host (SDL3 + OpenGL + Dear ImGui + Munt `libmt32emu` +
 
 ## Before & After (Identical In-Flight Frame)
 
-| Classic 1991 VGA (`320×200`, 4:3) | Native Host — Hybrid HD 3D Widescreen |
-| :---: | :---: |
-| ![Classic 1991 VGA](docs/screenshots/before_classic_vga.png) | ![Hybrid HD 3D Widescreen](docs/screenshots/after_hybrid_hd_widescreen.jpg) |
-| Original 4:3 DOS software renderer | 60+ FPS OpenGL 3D world, 14-band live `ALTPAL` sunset, faceted desert, coastline & 3D buildings, with Falcon's real 2D HUD, MFD & RWR locked 1:1 |
+### After — Native Host (Hybrid HD 3D Widescreen)
+60+ FPS OpenGL 3D world, 14-band live `ALTPAL` sunset, faceted desert, coastline & 3D buildings, with Falcon's real 2D HUD, MFD & RWR locked 1:1:
+
+![Hybrid HD 3D Widescreen](docs/screenshots/after_hybrid_hd_widescreen.jpg)
+
+### Before — Classic 1991 VGA (`320×200`, 4:3)
+Original 4:3 DOS software renderer:
+
+<img src="docs/screenshots/before_classic_vga.png" alt="Classic 1991 VGA" width="640" />
 
 ---
 
