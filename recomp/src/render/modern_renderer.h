@@ -87,6 +87,8 @@ struct FlightTelemetry {
 
     // Active Falcon 3.0 View Mode (0x13E28): 0=Fwd, 2=Left, 4=Right, 6=Rear, 18=External, 26=Padlock(8)
     uint16_t view_mode = 0;
+    uint16_t player_model_id = 3;       // objects index: 3=F16, 4=FA18, 17=MIG29
+    float    fwd_cockpit_cy_vga = 53.0f;// Forward cockpit optical horizon row (0..200)
     bool padlock_active = false;
     bool padlock_has_target = false;
     bool padlock_target_is_missile = false;
@@ -414,6 +416,8 @@ private:
     void draw_missiles_and_trails(const FlightTelemetry& tel);
     void draw_hud_digit_string(float x, float y, float scale, const std::string& text);
     bool is_alt_water_at(double wx, double wy) const;
+    float sample_alt_vertex_km(int tile_r, int tile_c, int sr, int sc) const;
+    float sample_alt_height_km(double wx, double wy) const;
     int resolve_model_index(uint16_t type_id) const;
     int resolve_ground_model_index(uint16_t type_id) const;
 };

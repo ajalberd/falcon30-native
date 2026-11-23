@@ -302,6 +302,62 @@ bool ModernRenderer::is_alt_water_at(double wx, double wy) const {
     return (tid == 0 || tid == 1);
 }
 
+float ModernRenderer::sample_alt_vertex_km(int tile_r, int tile_c, int sr, int sc) const {
+    if (!has_alt_terrain_) return 0.0f;
+    auto raw_h = [&](int tr, int tc, int r, int c) -> float {
+        if (tr < 0 || tr >= 32 || tc < 0 || tc >= 32) return 0.0f;
+        uint16_t tid = alt_tile_grid_[tr * 32 + tc] & 0x01FFu;
+        if (tid < 6 || tid >= alt_tile_count_) return 0.0f;
+        uint8_t b = alt_tile_data_[static_cast<size_t>(tid) * 256 + static_cast<size_t>(r) * 16 + static_cast<size_t>(c)];
+        // All real Falcon 3.0 terrain heights across all 8 theaters are 0..119; bytes >= 128 are sea-level sentinels
+        if (b >= 128) return 0.0f;
+        return static_cast<float>(b) * 0.024f * vr_cfg_.terrain_scale;
+    };
+
+    // Stitch shared boundary vertices seamlessly across adjacent 16x16 ALT.* tiles so zero cliff seams appear!
+    float sum = raw_h(tile_r, tile_c, sr, sc);
+    int cnt = 1;
+    if (sr == 0 && tile_r > 0)           { sum += raw_h(tile_r - 1, tile_c, 15, sc); cnt++; }
+    else if (sr == 15 && tile_r < 31)    { sum += raw_h(tile_r + 1, tile_c, 0, sc);  cnt++; }
+    if (sc == 0 && tile_c > 0)           { sum += raw_h(tile_r, tile_c - 1, sr, 15); cnt++; }
+    else if (sc == 15 && tile_c < 31)    { sum += raw_h(tile_r, tile_c + 1, sr, 0);  cnt++; }
+    if ((sr == 0 || sr == 15) && (sc == 0 || sc == 15)) {
+        int nr = (sr == 0) ? (tile_r - 1) : (tile_r + 1);
+        int nc = (sc == 0) ? (tile_c - 1) : (tile_c + 1);
+        if (nr >= 0 && nr < 32 && nc >= 0 && nc < 32) {
+            sum += raw_h(nr, nc, (sr == 0) ? 15 : 0, (sc == 0) ? 15 : 0);
+            cnt++;
+        }
+    }
+    return sum / static_cast<float>(cnt);
+}
+
+float ModernRenderer::sample_alt_height_km(double wx, double wy) const {
+    if (!has_alt_terrain_) return 0.0f;
+    double fx = (kTheaterHalfSpan - wx) / kAltTileUnits;
+    double fy = (wy + kTheaterHalfSpan) / kAltTileUnits;
+    int tr = static_cast<int>(std::floor(fx));
+    int tc = static_cast<int>(std::floor(fy));
+    if (tr < 0 || tr >= 32 || tc < 0 || tc >= 32) return 0.0f;
+    uint16_t tid = alt_tile_grid_[tr * 32 + tc] & 0x01FFu;
+    if (tid < 6 || tid >= alt_tile_count_) return 0.0f;
+
+    double sr_f = std::clamp((fx - static_cast<double>(tr)) * 15.0, 0.0, 15.0);
+    double sc_f = std::clamp((fy - static_cast<double>(tc)) * 15.0, 0.0, 15.0);
+    int sr0 = std::min(14, static_cast<int>(sr_f));
+    int sc0 = std::min(14, static_cast<int>(sc_f));
+    float fr = static_cast<float>(sr_f - static_cast<double>(sr0));
+    float fc = static_cast<float>(sc_f - static_cast<double>(sc0));
+
+    float h00 = sample_alt_vertex_km(tr, tc, sr0,     sc0);
+    float h10 = sample_alt_vertex_km(tr, tc, sr0,     sc0 + 1);
+    float h01 = sample_alt_vertex_km(tr, tc, sr0 + 1, sc0);
+    float h11 = sample_alt_vertex_km(tr, tc, sr0 + 1, sc0 + 1);
+    float h0 = h00 + (h10 - h00) * fc;
+    float h1 = h01 + (h11 - h01) * fc;
+    return h0 + (h1 - h0) * fr;
+}
+
 bool ModernRenderer::load_objects(const std::string& objects_path) {
     std::ifstream f(objects_path, std::ios::binary);
     if (!f) return false;
@@ -1514,15 +1570,10 @@ void ModernRenderer::draw_alt_terrain(const FlightTelemetry& tel) {
                 }
                 glEnd();
             } else if (tid >= 6 && tid < alt_tile_count_) {
-                // Detailed 16x16 mountain/hill elevation tile from ALT.*[0x1800 + tid*256]
-                const uint8_t* tdata = &alt_tile_data_[static_cast<size_t>(tid) * 256];
+                // Detailed 16x16 mountain/hill elevation tile from ALT.*[0x1800 + tid*256] (stitched across tile edges!)
                 double cell_step = kAltTileUnits / 15.0;
                 auto sample_h = [&](int sr, int sc) -> float {
-                    uint8_t b = tdata[sr * 16 + sc];
-                    // All real Falcon 3.0 terrain heights across all 8 theaters are signed 0..119;
-                    // bytes >= 128 (225=0xE1, 236=0xEC, 250=0xFA, 255=0xFF) are flat sea-level / special sentinels!
-                    if (b >= 128) return 0.0f;
-                    return static_cast<float>(b) * 0.024f * vr_cfg_.terrain_scale;
+                    return sample_alt_vertex_km(r, c, sr, sc);
                 };
 
                 glBegin(GL_TRIANGLES);
@@ -1646,7 +1697,9 @@ void ModernRenderer::draw_roads_and_rivers(const FlightTelemetry& tel) {
         if (len < 1e-5f) continue;
 
         float w = (seg.kind == 1) ? 0.072f : ((seg.kind == 2) ? 0.013f : 0.016f); // Sleek ~32m highway, 144m river, 26m rail/boundary
-        float y = (seg.kind == 1) ? 0.0225f : 0.0235f;
+        float y_off = (seg.kind == 1) ? 0.0225f : 0.0235f;
+        float y0 = sample_alt_height_km(seg.wx0, seg.wy0) + y_off;
+        float y1 = sample_alt_height_km(seg.wx1, seg.wy1) + y_off;
         float px = (-dz / len) * w;
         float pz = ( dx / len) * w;
         // Slight endcap overlap (0.55*w) prevents micro-cracks at 45-degree corners
@@ -1664,10 +1717,10 @@ void ModernRenderer::draw_roads_and_rivers(const FlightTelemetry& tel) {
             glColor3f(0.32f * lit_.ground_mul[0], 0.30f * lit_.ground_mul[1], 0.29f * lit_.ground_mul[2]);
         }
 
-        glVertex3f(x0 - ex - px, y, z0 - ez - pz);
-        glVertex3f(x0 - ex + px, y, z0 - ez + pz);
-        glVertex3f(x1 + ex + px, y, z1 + ez + pz);
-        glVertex3f(x1 + ex - px, y, z1 + ez - pz);
+        glVertex3f(x0 - ex - px, y0, z0 - ez - pz);
+        glVertex3f(x0 - ex + px, y0, z0 - ez + pz);
+        glVertex3f(x1 + ex + px, y1, z1 + ez + pz);
+        glVertex3f(x1 + ex - px, y1, z1 + ez - pz);
     }
     glEnd();
     glDisable(GL_POLYGON_OFFSET_FILL);
@@ -1686,7 +1739,8 @@ void ModernRenderer::draw_ils_runways(const FlightTelemetry& tel) {
         if (std::abs(x) > 75.0f || std::abs(z) > 75.0f) continue;
 
         glPushMatrix();
-        glTranslatef(x, 0.025f, z);
+        float rw_y = sample_alt_height_km(rw.wx, rw.wy) + 0.025f;
+        glTranslatef(x, rw_y, z);
         glRotatef(-rw.heading_deg, 0.0f, 1.0f, 0.0f);
 
         // Exact Falcon 3.0 4-cell runway dimensions: 2.00 km (6,554 ft) x 61 m (200 ft),
@@ -1826,7 +1880,7 @@ void ModernRenderer::draw_ground_structures(const FlightTelemetry& tel) {
         float max_r = mod.is_ground_decal ? 70.0f : 55.0f;
         if (std::abs(x) > max_r || std::abs(z) > max_r) continue;
 
-        float base_y = mod.is_ground_decal ? 0.025f : 0.020f;
+        float base_y = sample_alt_height_km(st.wx, st.wy) + (mod.is_ground_decal ? 0.025f : 0.020f);
         float dy = cam_y_km - base_y;
         float slant_km = std::sqrt(x * x + dy * dy + z * z);
         // Flat ground decals (runways 26..49, taxiways 103, pads) are ALWAYS strictly 1:1 physical geometry!
@@ -1901,7 +1955,7 @@ void ModernRenderer::draw_ground_structures(const FlightTelemetry& tel) {
             if (std::abs(x) > 48.0f || std::abs(z) > 48.0f) continue;
             float warm = hash2f(static_cast<int64_t>(i), st.model_id, 709);
             glColor4f(1.0f, 0.72f + 0.22f * warm, 0.30f + 0.35f * warm, glow * 0.85f);
-            glVertex3f(x, 0.032f, z);
+            glVertex3f(x, sample_alt_height_km(st.wx, st.wy) + 0.032f, z);
         }
         glEnd();
         glPointSize(1.0f);
@@ -2056,7 +2110,7 @@ void ModernRenderer::draw_world_entities(const FlightTelemetry& tel) {
         glRotatef(-ent.roll_deg, 0.0f, 0.0f, 1.0f);
         glScalef(vis_scale, vis_scale, vis_scale);
 
-        int mid = ent.is_player ? 3 : resolve_model_index(ent.type_id);
+        int mid = ent.is_player ? static_cast<int>(tel.player_model_id) : resolve_model_index(ent.type_id);
         if (mid >= 0 && mid < static_cast<int>(models_.size()) && !models_[mid].faces.empty()) {
             const ObjModel& mod = models_[mid];
             for (const auto& face : mod.faces) {
@@ -2119,7 +2173,7 @@ void ModernRenderer::draw_ground_units(const FlightTelemetry& tel) {
         float dist_sq = gx * gx + gz * gz;
         if (dist_sq > 45.0f * 45.0f) continue;
 
-        float gy = 0.024f + static_cast<float>(g.world_z * kHalfFtToKm);
+        float gy = 0.024f + std::max(static_cast<float>(g.world_z * kHalfFtToKm), sample_alt_height_km(g.world_x, g.world_y));
         float dy = gy - cam_y_km;
         float slant_km = std::sqrt(dist_sq + dy * dy);
 
@@ -3732,15 +3786,17 @@ void ModernRenderer::render_frame(int win_w, int win_h, GLuint vga_tex, GLuint v
         has_smooth_padlock_ = false;
     }
 
-    // Auto-compute exact optical horizon row cy_vga for the current Falcon view:
-    //  - Forward Cockpit (world_y 0..105):  cy = 53.0 (verified 1:1 with HUD 0-deg horizon & TD lock box!)
+    // Auto-compute exact optical horizon row cy_vga for the current Falcon/Hornet/MiG view:
+    //  - Forward Cockpit: title-specific optical horizon (53.0=F-16, 60.0=F/A-18, 50.0=MiG-29)
     //  - External Chase (world_y 0..169):   cy = 85.0
     //  - Padlock (world_y 35..199):         cy = 117.0 (or 100.0 if top strip hidden)
-    float cy_vga = 53.0f;
+    float base_cy = (tel.fwd_cockpit_cy_vga > 20.0f && tel.fwd_cockpit_cy_vga < 180.0f)
+                        ? tel.fwd_cockpit_cy_vga : 53.0f;
+    float cy_vga = base_cy;
     if (use_3d_padlock) {
         cy_vga = vr_cfg_.keep_padlock_top_strip ? 117.0f : 100.0f;
     } else if (is_forward_cockpit) {
-        cy_vga = 53.0f + vr_cfg_.hud_cy_trim_px;
+        cy_vga = base_cy + vr_cfg_.hud_cy_trim_px;
     } else {
         cy_vga = std::clamp(0.5f * static_cast<float>(tel.world_y_min + tel.world_y_max), 47.0f, 130.0f) + vr_cfg_.hud_cy_trim_px;
     }

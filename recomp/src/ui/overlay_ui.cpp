@@ -21,13 +21,16 @@ const char* hat_dir_name(uint8_t mask) {
 } // namespace
 
 OverlayUI::OverlayUI(DosMachine& machine, AudioEngine& audio, HotasMapper& hotas,
-                     NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model)
+                     NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model,
+                     HeadTracker& head_tracker, std::function<bool()> save_settings_cb)
     : machine_(machine), audio_(audio), hotas_(hotas), net_(net),
-      renderer_(renderer), flight_model_(flight_model) {
+      renderer_(renderer), flight_model_(flight_model), head_tracker_(head_tracker),
+      save_settings_cb_(std::move(save_settings_cb)) {
     std::snprintf(rom_dir_buf_, sizeof(rom_dir_buf_), "%s", audio_.config().cm32l_rom_dir.c_str());
 }
 
-void OverlayUI::draw(const FlightTelemetry& tel) {
+void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
+    now_sec_ = now_sec;
     if (!visible_) return;
 
     if (ImGui::BeginMainMenuBar()) {
@@ -49,6 +52,9 @@ void OverlayUI::draw(const FlightTelemetry& tel) {
             if (ImGui::MenuItem("Skip Intro Video on Launch", nullptr, &skip)) {
                 machine_.set_skip_intro(skip);
             }
+            if (save_settings_cb_ && ImGui::MenuItem("Save Settings Now (falcon3_config.json)")) {
+                config_status_ = save_settings_cb_() ? "Saved falcon3_config.json!" : "Save failed!";
+            }
             if (ImGui::MenuItem("Restart Current Title")) {
                 machine_.load_exe(machine_.game_dir(), machine_.current_exe());
             }
@@ -62,7 +68,7 @@ void OverlayUI::draw(const FlightTelemetry& tel) {
         ImGui::MenuItem("Multiplayer (UDP)", nullptr, &show_multiplayer_);
         ImGui::MenuItem("RE Debugger", nullptr, &show_debugger_);
         ImGui::Separator();
-        ImGui::TextDisabled("[F11] Render Mode | [F12] Overlay");
+        ImGui::TextDisabled("[F9] Recenter Head | [F11] Render Mode | [F12] Overlay");
         ImGui::EndMainMenuBar();
     }
 
@@ -186,9 +192,47 @@ void OverlayUI::draw_render_vr_window(const FlightTelemetry& tel) {
                         : (renderer_.cockpit_3d().has_any_views() ? "Partial" : "Waiting for flight..."));
     ImGui::SliderFloat("Head Look Yaw", &vr.head_yaw_deg, -175.0f, 175.0f, "%.1f");
     ImGui::SliderFloat("Head Look Pitch", &vr.head_pitch_deg, -68.0f, 82.0f, "%.1f");
-    if (ImGui::SmallButton("Recenter Head")) {
+    if (ImGui::SmallButton("Recenter Head (F9)")) {
         vr.head_yaw_deg = 0.0f;
         vr.head_pitch_deg = 0.0f;
+        head_tracker_.recenter();
+    }
+
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.45f, 0.88f, 1.0f, 1.0f), "OpenTrack / TrackIR Head Tracking (UDP)");
+    {
+        auto& htc = head_tracker_.config();
+        bool ot_conn = head_tracker_.is_connected(now_sec_);
+        ImGui::Checkbox("Enable OpenTrack UDP Receiver", &htc.enabled);
+        ImGui::SameLine();
+        if (!htc.enabled) {
+            ImGui::TextDisabled("[Disabled]");
+        } else if (ot_conn) {
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "[CONNECTED: Yaw %+.1f | Pitch %+.1f]",
+                               head_tracker_.yaw_deg(), head_tracker_.pitch_deg());
+        } else if (head_tracker_.is_listening()) {
+            ImGui::TextDisabled("[Listening on UDP %d]", htc.udp_port);
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "[Bind failed on UDP %d]", htc.udp_port);
+        }
+        if (htc.enabled) {
+            ImGui::SetNextItemWidth(110.0f);
+            ImGui::InputInt("UDP Port", &htc.udp_port);
+            if (htc.udp_port < 1024) htc.udp_port = 1024;
+            if (htc.udp_port > 65535) htc.udp_port = 65535;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Recenter OpenTrack")) {
+                head_tracker_.recenter();
+            }
+            ImGui::SliderFloat("TrackIR Yaw Scale", &htc.yaw_scale, 0.3f, 3.0f, "%.2fx");
+            ImGui::SliderFloat("TrackIR Pitch Scale", &htc.pitch_scale, 0.3f, 3.0f, "%.2fx");
+            ImGui::Checkbox("Invert Yaw", &htc.invert_yaw);
+            ImGui::SameLine();
+            ImGui::Checkbox("Invert Pitch", &htc.invert_pitch);
+        }
+    }
+    if (!config_status_.empty()) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.5f, 1.0f), "%s", config_status_.c_str());
     }
 
     ImGui::Separator();

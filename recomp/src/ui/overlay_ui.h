@@ -2,11 +2,13 @@
 
 #include "audio/audio_engine.h"
 #include "dos/dos_machine.h"
+#include "input/head_tracker.h"
 #include "input/hotas_mapper.h"
 #include "net/net_udp.h"
 #include "render/modern_renderer.h"
 #include "sim/f16_flight_model.h"
 
+#include <functional>
 #include <string>
 
 namespace falcon {
@@ -14,9 +16,10 @@ namespace falcon {
 class OverlayUI {
 public:
     OverlayUI(DosMachine& machine, AudioEngine& audio, HotasMapper& hotas,
-              NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model);
+              NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model,
+              HeadTracker& head_tracker, std::function<bool()> save_settings_cb = {});
 
-    void draw(const FlightTelemetry& tel);
+    void draw(const FlightTelemetry& tel, double now_sec = 0.0);
 
     bool visible() const { return visible_; }
     void toggle() { visible_ = !visible_; }
@@ -29,6 +32,10 @@ private:
     NetUdp& net_;
     ModernRenderer& renderer_;
     F16FlightModel& flight_model_;
+    HeadTracker& head_tracker_;
+    std::function<bool()> save_settings_cb_;
+    double now_sec_ = 0.0;
+    std::string config_status_;
 
     bool visible_ = true;
     bool show_hotas_ = false;

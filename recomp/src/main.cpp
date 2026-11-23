@@ -1,5 +1,6 @@
 #include "audio/audio_engine.h"
 #include "dos/dos_machine.h"
+#include "input/head_tracker.h"
 #include "input/hotas_mapper.h"
 #include "net/net_udp.h"
 #include "render/modern_renderer.h"
@@ -11,6 +12,18 @@
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
 #include <imgui_impl_sdl3.h>
+#include <nlohmann/json.hpp>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <shlobj.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -133,6 +147,271 @@ std::string find_rom_dir(const std::string& explicit_rom_dir) {
     return "roms";
 }
 
+fs::path resolve_config_dir(const std::string& game_dir) {
+    std::error_code ec;
+    fs::path gd = fs::weakly_canonical(fs::path(game_dir), ec);
+    if (!ec && !gd.empty()) {
+        std::string leaf = gd.filename().string();
+        std::transform(leaf.begin(), leaf.end(), leaf.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (leaf == "game_data" && gd.has_parent_path()) {
+            return gd.parent_path();
+        }
+    }
+    return fs::current_path(ec);
+}
+
+std::string pick_folder_native(const char* title) {
+#ifdef _WIN32
+    BROWSEINFOA bi{};
+    bi.lpszTitle = title;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_NONEWFOLDERBUTTON;
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderA(&bi);
+    if (!pidl) return "";
+    char path[MAX_PATH]{};
+    bool ok = SHGetPathFromIDListA(pidl, path) != FALSE;
+    CoTaskMemFree(pidl);
+    return ok ? std::string(path) : "";
+#else
+    (void)title;
+    return "";
+#endif
+}
+
+void peek_saved_paths(const std::string& cfg_path, std::string& out_game_dir, std::string& out_rom_dir) {
+    std::ifstream in(cfg_path);
+    if (!in) return;
+    try {
+        nlohmann::json j;
+        in >> j;
+        if (j.contains("paths") && j["paths"].is_object()) {
+            const auto& p = j["paths"];
+            if (out_game_dir.empty() && p.contains("game_dir") && p["game_dir"].is_string()) {
+                out_game_dir = p["game_dir"].get<std::string>();
+            }
+            if (out_rom_dir.empty() && p.contains("cm32l_rom_dir") && p["cm32l_rom_dir"].is_string()) {
+                out_rom_dir = p["cm32l_rom_dir"].get<std::string>();
+            }
+        }
+        if (out_rom_dir.empty() && j.contains("audio") && j["audio"].is_object() &&
+            j["audio"].contains("cm32l_rom_dir") && j["audio"]["cm32l_rom_dir"].is_string()) {
+            out_rom_dir = j["audio"]["cm32l_rom_dir"].get<std::string>();
+        }
+    } catch (...) {}
+}
+
+bool load_host_settings(const std::string& path,
+                        const std::string& explicit_rom_dir,
+                        falcon::AudioEngine& audio,
+                        falcon::ModernRenderer& renderer,
+                        falcon::F16FlightModel& flight_model,
+                        falcon::DosMachine& machine,
+                        falcon::HeadTracker& head_tracker,
+                        int& init_win_w,
+                        int& init_win_h) {
+    std::ifstream in(path);
+    if (!in) return false;
+    try {
+        nlohmann::json j;
+        in >> j;
+        if (j.contains("audio") && j["audio"].is_object()) {
+            const auto& a = j["audio"];
+            auto& ac = audio.config();
+            if (explicit_rom_dir.empty() && a.contains("cm32l_rom_dir") && a["cm32l_rom_dir"].is_string()) {
+                std::string saved_rom = a["cm32l_rom_dir"].get<std::string>();
+                if (!saved_rom.empty()) ac.cm32l_rom_dir = saved_rom;
+            }
+            if (a.contains("music_backend")) ac.music_backend = static_cast<falcon::MusicBackend>(std::clamp(a["music_backend"].get<int>(), 0, 2));
+            if (a.contains("enable_sb16_sfx")) ac.enable_sb16_sfx = a["enable_sb16_sfx"].get<bool>();
+            if (a.contains("use_cm32l_sample_proxy")) ac.use_cm32l_sample_proxy = a["use_cm32l_sample_proxy"].get<bool>();
+            if (a.contains("telemetry_flight_audio")) ac.telemetry_flight_audio = a["telemetry_flight_audio"].get<bool>();
+            if (a.contains("spatial_3d_audio")) ac.spatial_3d_audio = a["spatial_3d_audio"].get<bool>();
+            if (a.contains("audio_radio_ducking")) ac.audio_radio_ducking = a["audio_radio_ducking"].get<bool>();
+            if (a.contains("audio_warm_enhance")) ac.audio_warm_enhance = a["audio_warm_enhance"].get<bool>();
+            if (a.contains("gun_proxy_anti_drop")) ac.gun_proxy_anti_drop = a["gun_proxy_anti_drop"].get<bool>();
+            if (a.contains("master_volume")) ac.master_volume = std::clamp(a["master_volume"].get<float>(), 0.0f, 1.5f);
+            if (a.contains("mt32_volume")) ac.mt32_volume = std::clamp(a["mt32_volume"].get<float>(), 0.0f, 1.5f);
+            if (a.contains("engine_bus_volume")) ac.engine_bus_volume = std::clamp(a["engine_bus_volume"].get<float>(), 0.0f, 1.5f);
+            if (a.contains("wind_volume")) ac.wind_volume = std::clamp(a["wind_volume"].get<float>(), 0.0f, 1.5f);
+            if (a.contains("weapons_bus_volume")) ac.weapons_bus_volume = std::clamp(a["weapons_bus_volume"].get<float>(), 0.0f, 1.5f);
+            if (a.contains("avionics_bus_volume")) ac.avionics_bus_volume = std::clamp(a["avionics_bus_volume"].get<float>(), 0.0f, 1.5f);
+            if (a.contains("sb16_sfx_volume")) ac.sb16_sfx_volume = std::clamp(a["sb16_sfx_volume"].get<float>(), 0.0f, 1.5f);
+        }
+        if (j.contains("render") && j["render"].is_object()) {
+            const auto& r = j["render"];
+            auto& vr = renderer.vr_config();
+            if (r.contains("mode")) renderer.mode() = static_cast<falcon::RenderMode>(std::clamp(r["mode"].get<int>(), 0, 3));
+            if (r.contains("hybrid_fill_widescreen")) vr.hybrid_fill_widescreen = r["hybrid_fill_widescreen"].get<bool>();
+            if (r.contains("widescreen_3d_cockpit")) vr.widescreen_3d_cockpit = r["widescreen_3d_cockpit"].get<bool>();
+            if (r.contains("enhanced_3d_padlock")) vr.enhanced_3d_padlock = r["enhanced_3d_padlock"].get<bool>();
+            if (r.contains("keep_padlock_top_strip")) vr.keep_padlock_top_strip = r["keep_padlock_top_strip"].get<bool>();
+            if (r.contains("virtual_cockpit_freelook")) vr.virtual_cockpit_freelook = r["virtual_cockpit_freelook"].get<bool>();
+            if (r.contains("show_clouds")) vr.show_clouds = r["show_clouds"].get<bool>();
+            if (r.contains("show_aircraft")) vr.show_aircraft = r["show_aircraft"].get<bool>();
+            if (r.contains("show_ground_objects")) vr.show_ground_objects = r["show_ground_objects"].get<bool>();
+            if (r.contains("show_ground_units")) vr.show_ground_units = r["show_ground_units"].get<bool>();
+            if (r.contains("show_missiles_trails")) vr.show_missiles_trails = r["show_missiles_trails"].get<bool>();
+            if (r.contains("show_explosions")) vr.show_explosions = r["show_explosions"].get<bool>();
+            if (r.contains("show_contrails")) vr.show_contrails = r["show_contrails"].get<bool>();
+            if (r.contains("show_roads_rivers")) vr.show_roads_rivers = r["show_roads_rivers"].get<bool>();
+            if (r.contains("retro_desert_facets")) vr.retro_desert_facets = r["retro_desert_facets"].get<bool>();
+            if (r.contains("low_alt_sand_dots")) vr.low_alt_sand_dots = r["low_alt_sand_dots"].get<bool>();
+            if (r.contains("horizon_fog")) vr.horizon_fog = r["horizon_fog"].get<bool>();
+            if (r.contains("ground_shadows")) vr.ground_shadows = r["ground_shadows"].get<bool>();
+            if (r.contains("wireframe_terrain")) vr.wireframe_terrain = r["wireframe_terrain"].get<bool>();
+            if (r.contains("smart_scaling_mode")) vr.smart_scaling_mode = static_cast<falcon::SmartScalingMode>(std::clamp(r["smart_scaling_mode"].get<int>(), 0, 3));
+            if (r.contains("smart_scale_ground")) vr.smart_scale_ground = r["smart_scale_ground"].get<bool>();
+            if (r.contains("fov_deg")) vr.fov_deg = std::clamp(r["fov_deg"].get<float>(), 30.0f, 75.0f);
+            if (r.contains("widescreen_fov_deg")) vr.widescreen_fov_deg = std::clamp(r["widescreen_fov_deg"].get<float>(), 40.0f, 64.0f);
+            if (r.contains("aircraft_scale")) vr.aircraft_scale = std::clamp(r["aircraft_scale"].get<float>(), 0.5f, 2.5f);
+            if (r.contains("terrain_scale")) vr.terrain_scale = std::clamp(r["terrain_scale"].get<float>(), 0.5f, 3.0f);
+            if (r.contains("hud_cy_trim_px")) vr.hud_cy_trim_px = std::clamp(r["hud_cy_trim_px"].get<float>(), -12.0f, 12.0f);
+            if (r.contains("lighting_mode")) vr.lighting_mode = static_cast<falcon::LightingMode>(std::clamp(r["lighting_mode"].get<int>(), 0, 3));
+        }
+        if (j.contains("head_tracker") && j["head_tracker"].is_object()) {
+            const auto& ht = j["head_tracker"];
+            auto& htc = head_tracker.config();
+            if (ht.contains("enabled")) htc.enabled = ht["enabled"].get<bool>();
+            if (ht.contains("udp_port")) htc.udp_port = std::clamp(ht["udp_port"].get<int>(), 1024, 65535);
+            if (ht.contains("yaw_scale")) htc.yaw_scale = std::clamp(ht["yaw_scale"].get<float>(), 0.3f, 3.0f);
+            if (ht.contains("pitch_scale")) htc.pitch_scale = std::clamp(ht["pitch_scale"].get<float>(), 0.3f, 3.0f);
+            if (ht.contains("invert_yaw")) htc.invert_yaw = ht["invert_yaw"].get<bool>();
+            if (ht.contains("invert_pitch")) htc.invert_pitch = ht["invert_pitch"].get<bool>();
+        }
+        if (j.contains("flight_model") && j["flight_model"].is_object()) {
+            const auto& fm = j["flight_model"];
+            auto& fc = flight_model.config();
+            if (fm.contains("enabled")) fc.enabled = fm["enabled"].get<bool>();
+            if (fm.contains("cat3_limiter")) fc.cat3_limiter = fm["cat3_limiter"].get<bool>();
+            if (fm.contains("aoa_limiter")) fc.aoa_limiter = fm["aoa_limiter"].get<bool>();
+            if (fm.contains("engine_f110_ge100")) fc.engine_f110_ge100 = fm["engine_f110_ge100"].get<bool>();
+            if (fm.contains("max_roll_rate_dps")) fc.max_roll_rate_dps = std::clamp(fm["max_roll_rate_dps"].get<float>(), 90.0f, 360.0f);
+            if (fm.contains("stick_pitch_sens")) fc.stick_pitch_sens = std::clamp(fm["stick_pitch_sens"].get<float>(), 0.3f, 2.0f);
+            if (fm.contains("stick_roll_sens")) fc.stick_roll_sens = std::clamp(fm["stick_roll_sens"].get<float>(), 0.3f, 2.0f);
+        }
+        if (j.contains("host") && j["host"].is_object()) {
+            const auto& h = j["host"];
+            if (h.contains("skip_intro")) machine.set_skip_intro(h["skip_intro"].get<bool>());
+            if (h.contains("auto_turbo_in_flight")) machine.set_auto_turbo(h["auto_turbo_in_flight"].get<bool>());
+            if (h.contains("flight_cpu_speed_ips")) {
+                machine.set_flight_cpu_speed_ips(std::clamp<uint64_t>(h["flight_cpu_speed_ips"].get<uint64_t>(), 4000000ULL, 35000000ULL));
+            }
+            if (h.contains("flight_input_mode")) {
+                machine.set_flight_input_mode(static_cast<falcon::FlightInputMode>(std::clamp(h["flight_input_mode"].get<int>(), 0, 2)));
+            }
+            if (h.contains("sam_mod_preset")) {
+                machine.set_sam_mod_preset(static_cast<falcon::SamModPreset>(std::clamp(h["sam_mod_preset"].get<int>(), 0, 2)));
+            }
+            if (h.contains("window_w")) init_win_w = std::clamp(h["window_w"].get<int>(), 640, 7680);
+            if (h.contains("window_h")) init_win_h = std::clamp(h["window_h"].get<int>(), 480, 4320);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool save_host_settings(const std::string& path,
+                        const std::string& game_dir,
+                        const falcon::AudioEngine& audio,
+                        const falcon::ModernRenderer& renderer,
+                        const falcon::F16FlightModel& flight_model,
+                        const falcon::DosMachine& machine,
+                        const falcon::HeadTracker& head_tracker,
+                        int win_w,
+                        int win_h) {
+    try {
+        nlohmann::json j;
+        const auto& ac = audio.config();
+        j["paths"] = {
+            {"game_dir", game_dir},
+            {"cm32l_rom_dir", ac.cm32l_rom_dir},
+        };
+        j["audio"] = {
+            {"cm32l_rom_dir", ac.cm32l_rom_dir},
+            {"music_backend", static_cast<int>(ac.music_backend)},
+            {"enable_sb16_sfx", ac.enable_sb16_sfx},
+            {"use_cm32l_sample_proxy", ac.use_cm32l_sample_proxy},
+            {"telemetry_flight_audio", ac.telemetry_flight_audio},
+            {"spatial_3d_audio", ac.spatial_3d_audio},
+            {"audio_radio_ducking", ac.audio_radio_ducking},
+            {"audio_warm_enhance", ac.audio_warm_enhance},
+            {"gun_proxy_anti_drop", ac.gun_proxy_anti_drop},
+            {"master_volume", ac.master_volume},
+            {"mt32_volume", ac.mt32_volume},
+            {"engine_bus_volume", ac.engine_bus_volume},
+            {"wind_volume", ac.wind_volume},
+            {"weapons_bus_volume", ac.weapons_bus_volume},
+            {"avionics_bus_volume", ac.avionics_bus_volume},
+            {"sb16_sfx_volume", ac.sb16_sfx_volume},
+        };
+        const auto& vr = renderer.vr_config();
+        j["render"] = {
+            {"mode", static_cast<int>(renderer.mode())},
+            {"hybrid_fill_widescreen", vr.hybrid_fill_widescreen},
+            {"widescreen_3d_cockpit", vr.widescreen_3d_cockpit},
+            {"enhanced_3d_padlock", vr.enhanced_3d_padlock},
+            {"keep_padlock_top_strip", vr.keep_padlock_top_strip},
+            {"virtual_cockpit_freelook", vr.virtual_cockpit_freelook},
+            {"show_clouds", vr.show_clouds},
+            {"show_aircraft", vr.show_aircraft},
+            {"show_ground_objects", vr.show_ground_objects},
+            {"show_ground_units", vr.show_ground_units},
+            {"show_missiles_trails", vr.show_missiles_trails},
+            {"show_explosions", vr.show_explosions},
+            {"show_contrails", vr.show_contrails},
+            {"show_roads_rivers", vr.show_roads_rivers},
+            {"retro_desert_facets", vr.retro_desert_facets},
+            {"low_alt_sand_dots", vr.low_alt_sand_dots},
+            {"horizon_fog", vr.horizon_fog},
+            {"ground_shadows", vr.ground_shadows},
+            {"wireframe_terrain", vr.wireframe_terrain},
+            {"smart_scaling_mode", static_cast<int>(vr.smart_scaling_mode)},
+            {"smart_scale_ground", vr.smart_scale_ground},
+            {"fov_deg", vr.fov_deg},
+            {"widescreen_fov_deg", vr.widescreen_fov_deg},
+            {"aircraft_scale", vr.aircraft_scale},
+            {"terrain_scale", vr.terrain_scale},
+            {"hud_cy_trim_px", vr.hud_cy_trim_px},
+            {"lighting_mode", static_cast<int>(vr.lighting_mode)},
+        };
+        const auto& htc = head_tracker.config();
+        j["head_tracker"] = {
+            {"enabled", htc.enabled},
+            {"udp_port", htc.udp_port},
+            {"yaw_scale", htc.yaw_scale},
+            {"pitch_scale", htc.pitch_scale},
+            {"invert_yaw", htc.invert_yaw},
+            {"invert_pitch", htc.invert_pitch},
+        };
+        const auto& fc = flight_model.config();
+        j["flight_model"] = {
+            {"enabled", fc.enabled},
+            {"cat3_limiter", fc.cat3_limiter},
+            {"aoa_limiter", fc.aoa_limiter},
+            {"engine_f110_ge100", fc.engine_f110_ge100},
+            {"max_roll_rate_dps", fc.max_roll_rate_dps},
+            {"stick_pitch_sens", fc.stick_pitch_sens},
+            {"stick_roll_sens", fc.stick_roll_sens},
+        };
+        j["host"] = {
+            {"skip_intro", machine.skip_intro()},
+            {"auto_turbo_in_flight", machine.auto_turbo()},
+            {"flight_cpu_speed_ips", machine.flight_cpu_speed_ips()},
+            {"flight_input_mode", static_cast<int>(machine.flight_input_mode())},
+            {"sam_mod_preset", static_cast<int>(machine.sam_mod_preset())},
+            {"window_w", win_w},
+            {"window_h", win_h},
+        };
+        std::ofstream out(path);
+        if (!out) return false;
+        out << j.dump(2) << "\n";
+        return out.good();
+    } catch (...) {
+        return false;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -181,8 +460,31 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::string game_dir = find_game_dir(explicit_game_dir, argc, argv);
-    std::string rom_dir = find_rom_dir(explicit_rom_dir);
+    // Peek saved game_dir / rom_dir from falcon3_config.json (CLI flags always take priority!)
+    std::string cfg_dir_hint = (fs::current_path() / "falcon3_config.json").string();
+    std::string saved_game_dir, saved_rom_dir;
+    peek_saved_paths(cfg_dir_hint, saved_game_dir, saved_rom_dir);
+
+    std::string game_dir = find_game_dir(!explicit_game_dir.empty() ? explicit_game_dir : saved_game_dir, argc, argv);
+    if (!headless_test && resolve_falcon_dir(game_dir).empty()) {
+        std::string picked = pick_folder_native("Select your Falcon 3.0 Gold folder (containing FALCONCD.EXE or FALCON3\\)");
+        if (!picked.empty()) {
+            std::string resolved = resolve_falcon_dir(picked);
+            if (!resolved.empty()) {
+                game_dir = resolved;
+            } else {
+                game_dir = picked;
+            }
+        }
+    }
+    fs::path cfg_dir = resolve_config_dir(game_dir);
+    std::string config_path = (cfg_dir / "falcon3_config.json").string();
+    std::string hotas_path  = (cfg_dir / "falcon3_hotas.json").string();
+    if (saved_rom_dir.empty() && config_path != cfg_dir_hint) {
+        std::string dummy_gd;
+        peek_saved_paths(config_path, dummy_gd, saved_rom_dir);
+    }
+    std::string rom_dir = find_rom_dir(!explicit_rom_dir.empty() ? explicit_rom_dir : saved_rom_dir);
 
     if (headless_test) {
         falcon::AudioEngine audio;
@@ -371,16 +673,34 @@ int main(int argc, char** argv) {
 
     falcon::AudioEngine audio;
     audio.config().cm32l_rom_dir = rom_dir;
-    audio.init();
 
     falcon::HotasMapper hotas;
     hotas.init();
-    hotas.load_profile("falcon3_hotas.json");
+    if (!hotas.load_profile(hotas_path)) {
+        hotas.load_profile("falcon3_hotas.json");
+    }
 
     falcon::NetUdp net;
     net.init();
 
+    falcon::HeadTracker head_tracker;
     falcon::ModernRenderer renderer;
+    falcon::DosMachine machine(audio, hotas, net);
+    falcon::F16FlightModel flight_model;
+
+    int init_win_w = 1280, init_win_h = 800;
+    load_host_settings(config_path, explicit_rom_dir, audio, renderer, flight_model, machine, head_tracker, init_win_w, init_win_h);
+    if (init_win_w != 1280 || init_win_h != 800) {
+        SDL_SetWindowSize(window, init_win_w, init_win_h);
+    }
+    if (audio.config().cm32l_rom_dir.empty() || !has_mt32_roms_in(audio.config().cm32l_rom_dir)) {
+        audio.config().cm32l_rom_dir = rom_dir;
+    }
+    audio.init();
+    if (head_tracker.config().enabled) {
+        head_tracker.init(head_tracker.config().udp_port);
+    }
+
     renderer.load_theater_map((fs::path(game_dir) / "KUWAIT.MAP").string());
     renderer.load_alt_terrain((fs::path(game_dir) / "ALT.IRQ").string());
     renderer.load_isldat((fs::path(game_dir) / "ISLDAT.IRQ").string());
@@ -389,7 +709,6 @@ int main(int argc, char** argv) {
     renderer.load_mapobj_world((fs::path(game_dir) / "MAPOBJ.IRQ").string());
     renderer.load_ils_runways((fs::path(game_dir) / "ILS.IRQ").string());
 
-    falcon::DosMachine machine(audio, hotas, net);
     if (!machine.load_exe(game_dir, exe_name)) {
         std::string msg = "Could not find " + exe_name + " in:\n" + game_dir +
                           "\n\nPass your GOG Falcon Gold folder with:\n"
@@ -399,8 +718,12 @@ int main(int argc, char** argv) {
                                  msg.c_str(), window);
     }
 
-    falcon::F16FlightModel flight_model;
-    falcon::OverlayUI ui(machine, audio, hotas, net, renderer, flight_model);
+    auto save_settings_now = [&]() -> bool {
+        int cw = 1280, ch = 800;
+        SDL_GetWindowSize(window, &cw, &ch);
+        return save_host_settings(config_path, game_dir, audio, renderer, flight_model, machine, head_tracker, cw, ch);
+    };
+    falcon::OverlayUI ui(machine, audio, hotas, net, renderer, flight_model, head_tracker, save_settings_now);
 
     // OpenGL texture for 320x400 VGA framebuffer (supports both 320x200 and 320x400 Mode X!)
     GLuint vga_tex = 0, vga_cockpit_tex = 0, vga_hud_tex = 0;
@@ -493,6 +816,10 @@ int main(int argc, char** argv) {
             } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_F11) {
                 int next = (static_cast<int>(renderer.mode()) + 1) % 4;
                 renderer.mode() = static_cast<falcon::RenderMode>(next);
+            } else if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_F9) {
+                head_tracker.recenter();
+                renderer.vr_config().head_yaw_deg = 0.0f;
+                renderer.vr_config().head_pitch_deg = 0.0f;
             } else if (ev.type == SDL_EVENT_KEY_DOWN || ev.type == SDL_EVENT_KEY_UP) {
                 if (!ImGui::GetIO().WantCaptureKeyboard) {
                     // When Native F-16C Flight Model is active in flight, intercept flight-stick & rudder keys
@@ -1154,16 +1481,30 @@ int main(int argc, char** argv) {
         }
         renderer.render_frame(win_w, win_h, vga_tex, vga_cockpit_tex, vga_hud_tex, tel, static_cast<float>(dt_sec));
 
+        // Poll OpenTrack / TrackIR UDP 4242 head tracker (feeds 360-deg 3D Virtual Cockpit Free-Look when connected!)
+        head_tracker.poll(sim_clock_sec);
+        if (head_tracker.config().enabled && head_tracker.is_connected(sim_clock_sec) &&
+            prev_in_flight && !native_padlock_active && !rmb_freelook &&
+            renderer.mode() != falcon::RenderMode::ClassicVga &&
+            renderer.vr_config().virtual_cockpit_freelook) {
+            renderer.vr_config().head_yaw_deg   = head_tracker.yaw_deg();
+            renderer.vr_config().head_pitch_deg = head_tracker.pitch_deg();
+        }
+
         // Render Dear ImGui overlay
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        ui.draw(tel);
+        ui.draw(tel, sim_clock_sec);
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         SDL_GL_SwapWindow(window);
     }
+
+    // Persist host, renderer, audio, OpenTrack & Flight Model settings cleanly on exit
+    save_settings_now();
+    head_tracker.shutdown();
 
     glDeleteTextures(1, &vga_tex);
     glDeleteTextures(1, &vga_cockpit_tex);

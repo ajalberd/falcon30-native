@@ -1,0 +1,64 @@
+name: Build Windows Native Host (MSYS2 MinGW-w64)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-win64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-git
+            mingw-w64-ucrt-x86_64-binutils
+
+      - name: Configure CMake
+        run: |
+          cmake -S recomp -B recomp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build falcon30_native.exe
+        run: |
+          cmake --build recomp/build --parallel
+
+      - name: Verify Zero Non-Windows DLL Dependencies
+        run: |
+          echo "Checking imported DLLs of recomp/build/falcon30_native.exe..."
+          objdump -p recomp/build/falcon30_native.exe | grep "DLL Name:"
+          if objdump -p recomp/build/falcon30_native.exe | grep -iE "libwinpthread|libgcc|libstdc\+\+|SDL3"; then
+            echo "ERROR: Unexpected MinGW/third-party runtime DLL dependency found!"
+            exit 1
+          fi
+          echo "OK: 100% standalone Windows executable (only built-in OS DLLs)."
+
+      - name: Package Release Zip Artifact
+        run: |
+          mkdir -p staging
+          cp recomp/build/falcon30_native.exe staging/
+          cp README.md LICENSE launch_falcon3.bat.example staging/
+          powershell -Command "Compress-Archive -Path staging/* -DestinationPath falcon30-native-win64.zip -Force"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: falcon30-native-win64
+          path: falcon30-native-win64.zip
+          retention-days: 14

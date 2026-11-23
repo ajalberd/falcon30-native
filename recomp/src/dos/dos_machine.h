@@ -47,6 +47,38 @@ enum class FlightInputMode : int {
     ForceKeyboard = 2    // Always use Keyboard Only (+/- throttle & arrows)
 };
 
+enum class FalconTitle : int {
+    Falcon30 = 0, // FALCONCD.EXE (F-16C)
+    Hornet   = 1, // HORNETCD.EXE (F/A-18C)
+    MiG29    = 2  // MIGCD.EXE    (MiG-29A)
+};
+
+// Verified per-executable RAM layout & cockpit geometry across all 3 Falcon 3.0 Gold titles
+struct TitleProfile {
+    FalconTitle title           = FalconTitle::Falcon30;
+    const char* display_name    = "Falcon 3.0 (F-16C)";
+    uint32_t player_6dof_addr   = 0x47364; // Base of player 6-DOF flight struct
+    uint32_t camera_addr        = 0x45C10; // Active 3D camera struct (x,y,z,yaw,pitch,roll)
+    uint32_t entity_array_addr  = 0x43AB4; // Active 3D aircraft array (16 slots, stride 0x2C)
+    uint32_t ground_unit_addr   = 0x4403E; // Active ground units (100 slots, stride 0x36 = ent + 0x58A)
+    uint32_t missile_array_addr = 0x42170; // Active missiles (104 slots, stride 0x2A = ent - 0x1944)
+    uint32_t view_mode_addr     = 0x13E28; // Active cockpit/external view mode (0=Fwd, 2=L, 4=R, 6=Rear, 18=Ext, 26=Padlock)
+    uint32_t stores_id_addr     = 0x46CF8; // Selected stores type ID (3 or 4 == cannon)
+    uint32_t padlock_vec_addr   = 0x46190; // Unclamped padlock target vector (0 if unmapped)
+    uint32_t padlock_name_addr  = 0x46228; // Padlock target ASCII name (0 if unmapped)
+    // Intra-struct offsets inside player_6dof_addr (Hornet shifts +2 bytes starting at MSL/4)
+    uint16_t msl4_off           = 0x3E;
+    uint16_t agl4_off           = 0x40;
+    uint16_t weight_off         = 0x42;
+    uint16_t tas_off            = 0x4C;
+    uint16_t vel_off            = 0x50;    // vn/ve/vu (3 x int16) + z_copy (+6)
+    uint16_t g_load_off         = 0xCE;
+    uint16_t ab_flag_off        = 0xD1;
+    // 3D rendering defaults
+    uint16_t player_model_id    = 3;       // game_data/objects index: 3=F16, 4=FA18, 17=MIG29
+    float    fwd_cockpit_cy_vga = 53.0f;   // Forward cockpit optical horizon row (0..200)
+};
+
 struct SamModStatus {
     bool table_found = false;
     uint32_t sig_addr = 0;
@@ -75,30 +107,22 @@ public:
     bool load_exe(const std::string& game_dir, const std::string& exe_name);
     const std::string& current_exe() const { return exe_name_; }
     const std::string& game_dir() const { return game_dir_; }
+    const TitleProfile& title_profile() const { return profile_; }
     void reset();
 
-    // Read live F-16 flight telemetry from Falcon 3.0 RAM (verified struct @ 0x47364)
+    // Read live flight telemetry from active title RAM (Falcon 3.0 / Hornet / MiG-29 via TitleProfile)
     FlightTelemetry read_flight_telemetry() const;
     void read_player_fm_extras(float& weight_lbs, float& throttle_01) const;
     void read_flight_audio_extras(float& rpm_pct, float& throttle_01, int& ab_stage, float& g_load) const;
-    // Selected stores type ID (FALCONCD @ 0x46CF8, mirrored at 0x4640A / 0x4A09A). IDs index the stores name table
-    // (AIM9P=0, AIM9M=1, AIM120=2, M61=3, M61=4, LAU=5, AGM88=6, AGM45=7, AGM65B=8, GBU15=9, AGM65D=10, DUR=11, ...).
-    // Verified by headless RAM diffs while cycling weapons with Enter / Backspace.
-    uint16_t selected_stores_id() const { return static_cast<uint16_t>(mem_[0x46CF8] | (mem_[0x46CF9] << 8)); }
+    // Selected stores type ID (3 or 4 == M61/ACAN cannon across Falcon / Hornet / MiG-29)
+    uint16_t selected_stores_id() const {
+        uint32_t a = profile_.stores_id_addr;
+        if (a == 0 || a + 1 >= MEM_SIZE) return 3;
+        return static_cast<uint16_t>(mem_[a] | (mem_[a + 1] << 8));
+    }
     bool is_cannon_selected() const {
-        static constexpr char kFalcon[] = "FALCONCD.EXE";
-        bool is_falcon = exe_name_.size() == sizeof(kFalcon) - 1;
-        for (size_t i = 0; is_falcon && i < exe_name_.size(); ++i) {
-            char c = exe_name_[i];
-            if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-            is_falcon = (c == kFalcon[i]);
-        }
-        if (is_falcon) {
-            uint16_t id = selected_stores_id();
-            return id == 3 || id == 4;
-        }
-        // Hornet / MiG: stores ID address not yet mapped (legacy, unverified check)
-        return mem_[0x68D96] == 0 && mem_[0x68D9A] == 0;
+        uint16_t id = selected_stores_id();
+        return id == 3 || id == 4;
     }
     const std::string& loaded_exe_sha256() const { return loaded_exe_sha256_; }
     bool loaded_exe_sha_verified() const { return loaded_exe_sha_verified_; }
@@ -208,6 +232,7 @@ private:
     std::vector<uint8_t> mem_;
     std::string game_dir_;
     std::string exe_name_;
+    TitleProfile profile_;
     std::string loaded_exe_sha256_;
     bool loaded_exe_sha_verified_ = false;
 

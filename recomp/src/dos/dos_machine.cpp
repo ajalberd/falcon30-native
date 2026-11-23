@@ -219,6 +219,59 @@ bool DosMachine::load_exe(const std::string& game_dir, const std::string& exe_na
             (loaded_exe_sha_verified_ ? "VERIFIED FALCON GOLD CD" : "UNVERIFIED VARIANT — offsets may differ") + "]");
     }
 
+    // Select verified per-title RAM profile (Falcon 3.0 / Hornet / MiG-29)
+    {
+        std::string uexe = to_upper(exe_name);
+        profile_ = TitleProfile{}; // Default: Falcon 3.0 (FALCONCD.EXE)
+        if (uexe.find("HORNET") != std::string::npos) {
+            profile_.title              = FalconTitle::Hornet;
+            profile_.display_name       = "Hornet: Naval Strike (F/A-18C)";
+            profile_.player_6dof_addr   = 0x450A2;
+            profile_.camera_addr        = 0x442B0;
+            profile_.entity_array_addr  = 0x4B754;
+            profile_.ground_unit_addr   = 0x4BCDE; // entity_array + 0x58A
+            profile_.missile_array_addr = 0x49E10; // entity_array - 0x1944
+            profile_.view_mode_addr     = 0x13F48;
+            profile_.stores_id_addr     = 0x449B2;
+            profile_.padlock_vec_addr   = 0;
+            profile_.padlock_name_addr  = 0;
+            profile_.msl4_off           = 0x40;    // Hornet shifts +2 B from MSL/4 onward
+            profile_.agl4_off           = 0x42;
+            profile_.weight_off         = 0x44;
+            profile_.tas_off            = 0x4E;
+            profile_.vel_off            = 0x52;
+            profile_.g_load_off         = 0x24;    // 10 = 1.0G in Hornet 6-DOF struct
+            profile_.ab_flag_off        = 0xD1;
+            profile_.player_model_id    = 4;       // game_data/objects[4] = FA18
+            profile_.fwd_cockpit_cy_vga = 60.0f;
+        } else if (uexe.find("MIG") != std::string::npos) {
+            profile_.title              = FalconTitle::MiG29;
+            profile_.display_name       = "MiG-29: Deadly Adversary";
+            profile_.player_6dof_addr   = 0x48CC2;
+            profile_.camera_addr        = 0x47440;
+            profile_.entity_array_addr  = 0x452BA;
+            profile_.ground_unit_addr   = 0x45844; // entity_array + 0x58A
+            profile_.missile_array_addr = 0x43976; // entity_array - 0x1944
+            profile_.view_mode_addr     = 0x139D8;
+            profile_.stores_id_addr     = 0x4BA46;
+            profile_.padlock_vec_addr   = 0;
+            profile_.padlock_name_addr  = 0;
+            profile_.msl4_off           = 0x3E;
+            profile_.agl4_off           = 0x40;
+            profile_.weight_off         = 0x42;
+            profile_.tas_off            = 0x4C;
+            profile_.vel_off            = 0x50;
+            profile_.g_load_off         = 0xCE;
+            profile_.ab_flag_off        = 0xD1;
+            profile_.player_model_id    = 17;      // game_data/objects[17] = MIG29
+            profile_.fwd_cockpit_cy_vga = 50.0f;
+        }
+        log(std::string("TITLE PROFILE: ") + profile_.display_name +
+            " (6DOF=0x" + [&]{ char b[16]; std::snprintf(b, sizeof(b), "%X", profile_.player_6dof_addr); return std::string(b); }() +
+            " CAM=0x" + [&]{ char b[16]; std::snprintf(b, sizeof(b), "%X", profile_.camera_addr); return std::string(b); }() +
+            " ENT=0x" + [&]{ char b[16]; std::snprintf(b, sizeof(b), "%X", profile_.entity_array_addr); return std::string(b); }() + ")");
+    }
+
     auto rd16 = [&](size_t off) -> uint16_t {
         return static_cast<uint16_t>(data[off] | (data[off + 1] << 8));
     };
@@ -1124,7 +1177,8 @@ void DosMachine::int_21h() {
                             (uname.find("ALT.") != std::string::npos ||
                              uname.find("ISLDAT.") != std::string::npos ||
                              uname.find("MAPOBJ.") != std::string::npos ||
-                             uname.find("ILS.") != std::string::npos)) {
+                             uname.find("ILS.") != std::string::npos ||
+                             uname.find("ILM.") != std::string::npos)) {
                             in_3d_flight_session_ = true;
                             if (detected_theater_ext_ != ext) {
                                 detected_theater_ext_ = ext;
@@ -1755,7 +1809,17 @@ void DosMachine::poll_ipx_udp() {
 
 FlightTelemetry DosMachine::read_flight_telemetry() const {
     FlightTelemetry t{};
-    // Verified live F-16 flight state struct @ physical 0x47364 in FALCONCD.EXE
+    t.player_model_id = profile_.player_model_id;
+    t.fwd_cockpit_cy_vga = profile_.fwd_cockpit_cy_vga;
+
+    // Verified live 6-DOF flight state struct via TitleProfile (Falcon / Hornet / MiG-29)
+    const uint32_t p6  = profile_.player_6dof_addr;
+    const uint32_t cam = profile_.camera_addr;
+    const uint32_t ent = profile_.entity_array_addr;
+    const uint32_t gnd = profile_.ground_unit_addr;
+    const uint32_t msl = profile_.missile_array_addr;
+    const uint32_t vma = profile_.view_mode_addr;
+
     auto rd_u16 = [&](uint32_t a) -> uint16_t {
         return static_cast<uint16_t>(mem_[a] | (mem_[a + 1] << 8));
     };
@@ -1766,19 +1830,19 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
         return static_cast<int32_t>(rd_u16(a) | (static_cast<uint32_t>(rd_u16(a + 2)) << 16));
     };
 
-    uint16_t mach100 = rd_u16(0x47376);
-    uint16_t kias = rd_u16(0x47378);
-    uint16_t rpm = rd_u16(0x4737C);
-    uint16_t alt_msl4 = rd_u16(0x473A2);
-    uint16_t alt_agl4 = rd_u16(0x473A4);
-    uint16_t z_half_ft = rd_u16(0x4736C);
+    uint16_t mach100 = rd_u16(p6 + 0x12u);
+    uint16_t kias = rd_u16(p6 + 0x14u);
+    uint16_t rpm = rd_u16(p6 + 0x18u);
+    uint16_t alt_msl4 = rd_u16(p6 + profile_.msl4_off);
+    uint16_t alt_agl4 = rd_u16(p6 + profile_.agl4_off);
+    uint16_t z_half_ft = rd_u16(p6 + 0x08u);
 
     // Detect active 3D flight BOTH airborne (kias > 10) AND sitting at 0..10 kts on the runway / zoom-in
     // in Campaign / Red Flag / Training missions (so Hybrid Mode & 20-MIPS Auto-Turbo engage immediately!)
-    int32_t cam_x0 = rd_i32(0x45C10);
-    int32_t cam_y0 = rd_i32(0x45C14);
-    int32_t pos_x0 = rd_i32(0x47364);
-    int32_t pos_y0 = rd_i32(0x47368);
+    int32_t cam_x0 = rd_i32(cam + 0x00u);
+    int32_t cam_y0 = rd_i32(cam + 0x04u);
+    int32_t pos_x0 = rd_i32(p6 + 0x00u);
+    int32_t pos_y0 = rd_i32(p6 + 0x04u);
     bool has_valid_cam0 = (cam_x0 != 0 || cam_y0 != 0) &&
                           std::abs(cam_x0) < 10000000 && std::abs(cam_y0) < 10000000;
     bool has_valid_pos0 = (pos_x0 != 0 || pos_y0 != 0) &&
@@ -1790,8 +1854,8 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
 
     if (airborne || on_runway_3d) {
         t.in_flight = true;
-        t.world_x = static_cast<double>(rd_i32(0x47364));
-        t.world_y = static_cast<double>(rd_i32(0x47368));
+        t.world_x = static_cast<double>(rd_i32(p6 + 0x00u));
+        t.world_y = static_cast<double>(rd_i32(p6 + 0x04u));
         t.altitude_ft = (z_half_ft > 0) ? (static_cast<float>(z_half_ft) * 0.5f)
                                         : (static_cast<float>(alt_msl4) * 4.0f);
         t.agl_ft = static_cast<float>(alt_agl4) * 4.0f;
@@ -1804,35 +1868,33 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
             return static_cast<float>(v) * (360.0f / 16384.0f);
         };
 
-        uint16_t raw_yaw = rd_u16(0x47370) & 0x3FFF;
-        uint16_t raw_pitch = rd_u16(0x47372);
-        uint16_t raw_roll = rd_u16(0x47374);
+        uint16_t raw_yaw = rd_u16(p6 + 0x0Cu) & 0x3FFF;
+        uint16_t raw_pitch = rd_u16(p6 + 0x0Eu);
+        uint16_t raw_roll = rd_u16(p6 + 0x10u);
 
         t.yaw_deg = static_cast<float>(raw_yaw) * (360.0f / 16384.0f);
         t.pitch_deg = std::clamp(bam14_signed_deg(raw_pitch), -89.5f, 89.5f);
         t.roll_deg = bam14_signed_deg(raw_roll);
         t.airspeed_kts = static_cast<float>(kias);
         t.mach = static_cast<float>(mach100) * 0.01f;
-        t.g_load = std::clamp(static_cast<float>(rd_i16(0x47432)) * 0.1f, -4.0f, 12.0f);
+        t.g_load = std::clamp(static_cast<float>(rd_i16(p6 + profile_.g_load_off)) * 0.1f, -4.0f, 12.0f);
 
-        // Read active Falcon 3.0 View Mode @ 0x13E28 BEFORE resolving camera so Forward Cockpit (0) never flickers!
+        // Read active View Mode BEFORE resolving camera so Forward Cockpit (0) never flickers!
         // (0=Fwd, 2=Left, 4=Right, 6=Rear, 18=External/Chase/Flyby, 26=Padlock)
-        t.view_mode = rd_u16(0x13E28);
+        t.view_mode = rd_u16(vma);
         t.padlock_active = (t.view_mode == 26);
 
-        // Read Falcon 3.0's active 3D camera state @ 0x45C10 (tracks Side/Rear, Padlock, Chase, Orbit, Flyby, Enemy!)
-        int32_t cx = rd_i32(0x45C10);
-        int32_t cy = rd_i32(0x45C14);
-        int32_t cz = rd_i32(0x45C18);
+        // Read active 3D camera state (tracks Side/Rear, Padlock, Chase, Orbit, Flyby, Enemy!)
+        int32_t cx = rd_i32(cam + 0x00u);
+        int32_t cy = rd_i32(cam + 0x04u);
+        int32_t cz = rd_i32(cam + 0x08u);
         bool valid_cam = (cx != 0 || cy != 0) && std::abs(cx) < 10000000 && std::abs(cy) < 10000000 && cz >= 0 && cz < 200000;
         double dcz = valid_cam ? std::abs(static_cast<double>(cz) - static_cast<double>(z_half_ft)) : 0.0;
         bool is_cockpit_view = (t.view_mode == 0 || t.view_mode == 2 || t.view_mode == 4 || t.view_mode == 6 || t.view_mode == 26);
 
         if (t.view_mode == 0 && (!valid_cam || dcz < 250.0)) {
             // In Forward Cockpit (view_mode == 0, excluding high-altitude Campaign zoom-in where dcz >= 250),
-            // lock directly to the atomic player aircraft state (0x47364..0x47374)!
-            // Prevents 1-tick async lag (|C - P| > 120 half-ft at 400+ kts) and scratch overwrites of 0x45C10 from
-            // causing vertical view / external-camera flicker!
+            // lock directly to the atomic player aircraft state!
             t.has_camera = true;
             t.cam_x = t.world_x;
             t.cam_y = t.world_y;
@@ -1846,9 +1908,9 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
             t.cam_x = static_cast<double>(cx);
             t.cam_y = static_cast<double>(cy);
             t.cam_alt_ft = static_cast<float>(cz) * 0.5f;
-            t.cam_yaw_deg = static_cast<float>(rd_u16(0x45C1C) & 0x3FFFu) * (360.0f / 16384.0f);
-            t.cam_pitch_deg = std::clamp(bam14_signed_deg(rd_u16(0x45C1E)), -89.5f, 89.5f);
-            t.cam_roll_deg = bam14_signed_deg(rd_u16(0x45C20));
+            t.cam_yaw_deg = static_cast<float>(rd_u16(cam + 0x0Cu) & 0x3FFFu) * (360.0f / 16384.0f);
+            t.cam_pitch_deg = std::clamp(bam14_signed_deg(rd_u16(cam + 0x0Eu)), -89.5f, 89.5f);
+            t.cam_roll_deg = bam14_signed_deg(rd_u16(cam + 0x10u));
 
             double dcx = t.cam_x - t.world_x;
             double dcy = t.cam_y - t.world_y;
@@ -1865,11 +1927,11 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
             t.is_external_cam = false;
         }
 
-        // 1. Read all active 3D aircraft from 0x43AB4 (16 slots, stride 0x2C = 44 B)
-        // Slot 0 = player F-16 (rendered in external views!), slots 1..15 = active AI aircraft
+        // 1. Read all active 3D aircraft (16 slots, stride 0x2C = 44 B)
+        // Slot 0 = player aircraft (rendered in external views!), slots 1..15 = active AI aircraft
         t.entities.reserve(16);
         for (int i = 0; i < 16; ++i) {
-            uint32_t base = 0x43AB4u + static_cast<uint32_t>(i) * 0x2Cu;
+            uint32_t base = ent + static_cast<uint32_t>(i) * 0x2Cu;
             uint16_t type_w = rd_u16(base + 0x26);
             if ((type_w & 0x8000u) == 0) continue; // Inactive slot
             int32_t ex = rd_i32(base + 0x00);
@@ -1878,25 +1940,25 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
             if (ex == 0 && ey == 0 && ez == 0) continue;
             if (std::abs(ex) > 10000000 || std::abs(ey) > 10000000 || ez < -5000 || ez > 200000) continue;
 
-            WorldEntity ent;
-            ent.world_x = static_cast<double>(ex);
-            ent.world_y = static_cast<double>(ey);
-            ent.world_z = static_cast<double>(ez);
-            ent.yaw_deg = static_cast<float>(rd_u16(base + 0x0C) & 0x3FFFu) * (360.0f / 16384.0f);
-            ent.pitch_deg = std::clamp(bam14_signed_deg(rd_u16(base + 0x0E)), -89.5f, 89.5f);
-            ent.roll_deg = bam14_signed_deg(rd_u16(base + 0x10));
-            ent.flight_id = rd_u16(base + 0x22);
-            ent.flags = rd_u16(base + 0x24);
-            ent.type_id = type_w & 0x7FFFu;
-            ent.is_player = (i == 0);
-            ent.is_ground = false;
-            t.entities.push_back(ent);
+            WorldEntity ent_obj;
+            ent_obj.world_x = static_cast<double>(ex);
+            ent_obj.world_y = static_cast<double>(ey);
+            ent_obj.world_z = static_cast<double>(ez);
+            ent_obj.yaw_deg = static_cast<float>(rd_u16(base + 0x0C) & 0x3FFFu) * (360.0f / 16384.0f);
+            ent_obj.pitch_deg = std::clamp(bam14_signed_deg(rd_u16(base + 0x0E)), -89.5f, 89.5f);
+            ent_obj.roll_deg = bam14_signed_deg(rd_u16(base + 0x10));
+            ent_obj.flight_id = rd_u16(base + 0x22);
+            ent_obj.flags = rd_u16(base + 0x24);
+            ent_obj.type_id = type_w & 0x7FFFu;
+            ent_obj.is_player = (i == 0);
+            ent_obj.is_ground = false;
+            t.entities.push_back(ent_obj);
         }
 
-        // 2. Read all active ground vehicles, armored columns, AAA & SAM batteries from 0x4403E (100 slots, stride 0x36 = 54 B)
+        // 2. Read all active ground vehicles, armored columns, AAA & SAM batteries (100 slots, stride 0x36 = 54 B)
         t.ground_units.reserve(72);
         for (int i = 0; i < 100; ++i) {
-            uint32_t base = 0x4403Eu + static_cast<uint32_t>(i) * 0x36u;
+            uint32_t base = gnd + static_cast<uint32_t>(i) * 0x36u;
             uint16_t flags = rd_u16(base + 0x24);
             uint16_t type_w = rd_u16(base + 0x26);
             if ((flags & 0x4014u) != 0x4014u || (type_w & 0x8000u) == 0) continue;
@@ -1923,11 +1985,10 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
             t.ground_units.push_back(g);
         }
 
-        // 3. Read all active in-flight SAM & AAM missiles from 0x42170 (104 slots, stride 0x2A = 42 B, flags == 0x4015)
-        // Covers both active missile sub-pools (slots 40..71 @ 0x42170..0x42686 & slots 72..143 @ 0x426B0..0x43256)
+        // 3. Read all active in-flight SAM & AAM missiles (104 slots, stride 0x2A = 42 B, flags == 0x4015)
         t.missiles.reserve(16);
         for (int i = 0; i < 104; ++i) {
-            uint32_t base = 0x42170u + static_cast<uint32_t>(i) * 0x2Au;
+            uint32_t base = msl + static_cast<uint32_t>(i) * 0x2Au;
             uint16_t flags = rd_u16(base + 0x24);
             if ((flags & 0x4015u) != 0x4015u) continue;
             int32_t mx = rd_i32(base + 0x00);
@@ -1952,11 +2013,11 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
         }
 
         // 4. Resolve the EXACT unclamped 3D Padlock target (aircraft OR incoming SAM/AAM) when in Padlock view (26)!
-        if (t.padlock_active) {
-            // Read ASCII target name @ 0x46228 ("SU25", "MIG29", "SAM", "AIM-9", "MISSILE", etc.)
+        if (t.padlock_active && profile_.padlock_vec_addr != 0 && profile_.padlock_name_addr != 0) {
+            // Read ASCII target name ("SU25", "MIG29", "SAM", "AIM-9", "MISSILE", etc.)
             int nlen = 0;
             for (int k = 0; k < 12; ++k) {
-                char c = static_cast<char>(mem_[0x46228u + static_cast<uint32_t>(k)]);
+                char c = static_cast<char>(mem_[profile_.padlock_name_addr + static_cast<uint32_t>(k)]);
                 if (c == '\0') break;
                 if (c >= 32 && c < 127) t.padlock_target_name[nlen++] = c;
             }
@@ -1970,15 +2031,16 @@ FlightTelemetry DosMachine::read_flight_telemetry() const {
                                        std::strstr(t.padlock_target_name, "SA-") != nullptr ||
                                        std::strstr(t.padlock_target_name, "AA-") != nullptr);
 
-            // Falcon 3.0 stores the live unclamped Padlock target vector @ 0x46190..0x4619C:
-            //   0x46190 (uint8) = fixed-point shift factor
-            //   0x46192/94/96 (int16) = Aircraft body-frame (Right, Down, Forward)
-            //   0x46198/9A/9C (int16) = World-space (dE, -dZ, dN)  <-- EXACT WORLD DELTA!
-            uint8_t shift = mem_[0x46190];
+            // Live unclamped Padlock target vector:
+            //   +0 (uint8) = fixed-point shift factor
+            //   +2/+4/+6 (int16) = Aircraft body-frame (Right, Down, Forward)
+            //   +8/+A/+C (int16) = World-space (dE, -dZ, dN)
+            const uint32_t pv = profile_.padlock_vec_addr;
+            uint8_t shift = mem_[pv];
             if (shift == 0 || shift > 10) shift = 1;
-            double dE_raw = static_cast<double>(rd_i16(0x46198));
-            double dZ_raw = -static_cast<double>(rd_i16(0x4619A));
-            double dN_raw = static_cast<double>(rd_i16(0x4619C));
+            double dE_raw = static_cast<double>(rd_i16(pv + 8u));
+            double dZ_raw = -static_cast<double>(rd_i16(pv + 10u));
+            double dN_raw = static_cast<double>(rd_i16(pv + 12u));
             double raw_len = std::sqrt(dN_raw * dN_raw + dE_raw * dE_raw + dZ_raw * dZ_raw);
 
             if (raw_len > 2.0) {
@@ -2085,7 +2147,7 @@ bool DosMachine::harvest_cockpit_views(Cockpit3D& out) {
     };
 
     // Only harvest when cleanly sitting in Forward Cockpit (view_mode == 0) AND the frame is fully rendered (not black fade-in!)
-    if (rd_u16(0x13E28) != 0) return false;
+    if (rd_u16(profile_.view_mode_addr) != 0) return false;
 
     std::vector<uint8_t> idx_buf(Cockpit3D::kSpriteW * Cockpit3D::kSpriteH);
     std::vector<uint8_t> prev_buf(Cockpit3D::kSpriteW * Cockpit3D::kSpriteH);
@@ -2125,7 +2187,7 @@ bool DosMachine::harvest_cockpit_views(Cockpit3D& out) {
         for (int iter = 0; iter < 60; ++iter) {
             step(50000);
             on_frame_tick();
-            if (rd_u16(0x13E28) == expected_mode) {
+            if (rd_u16(profile_.view_mode_addr) == expected_mode) {
                 switched = true;
                 // Wait until Falcon actually blits the new cockpit sprite to the active VRAM page
                 // (verify both valid cockpit+world pixels AND pixel change from previous view!)
@@ -2176,31 +2238,36 @@ bool DosMachine::harvest_cockpit_views(Cockpit3D& out) {
 }
 
 void DosMachine::read_player_fm_extras(float& weight_lbs, float& throttle_01) const {
+    const uint32_t p6 = profile_.player_6dof_addr;
     auto rd_u16 = [&](uint32_t addr) -> uint16_t {
         return static_cast<uint16_t>(mem_[addr] | (static_cast<uint16_t>(mem_[addr + 1]) << 8));
     };
-    uint16_t w = rd_u16(0x473A6);
-    uint16_t thr = rd_u16(0x4737C);
-    weight_lbs = (w >= 14000 && w <= 42000) ? static_cast<float>(w) : 21500.0f;
-    // Falcon stores throttle 0..100 (or 0..115 in AB) at 0x4737C
+    uint16_t w = rd_u16(p6 + profile_.weight_off);
+    uint16_t thr = rd_u16(p6 + 0x18u);
+    weight_lbs = (w >= 14000 && w <= 45000) ? static_cast<float>(w) : 21500.0f;
+    // Falcon stores throttle/RPM 0..100 (or 0..115 in AB) at p6 + 0x18
     throttle_01 = std::clamp(static_cast<float>(thr) / 100.0f, 0.0f, 1.0f);
 }
 
 void DosMachine::read_flight_audio_extras(float& rpm_pct, float& throttle_01, int& ab_stage, float& g_load) const {
+    const uint32_t p6 = profile_.player_6dof_addr;
     auto rd_u16 = [&](uint32_t addr) -> uint16_t {
         return static_cast<uint16_t>(mem_[addr] | (static_cast<uint16_t>(mem_[addr + 1]) << 8));
     };
-    uint16_t rpm = rd_u16(0x4737C);
-    uint16_t raw_thr = rd_u16(0x47392);
-    uint16_t ab = rd_u16(0x47382);
-    int16_t g10 = static_cast<int16_t>(rd_u16(0x47432));
+    uint16_t rpm = rd_u16(p6 + 0x18u);
+    uint16_t raw_thr = rd_u16(p6 + 0x2Eu);
+    uint16_t ab = rd_u16(p6 + 0x1Eu);
+    int16_t g10 = static_cast<int16_t>(rd_u16(p6 + profile_.g_load_off));
     rpm_pct = std::clamp(static_cast<float>(rpm), 0.0f, 115.0f);
     throttle_01 = std::clamp(static_cast<float>(raw_thr) / 305.0f, 0.0f, 1.0f);
-    ab_stage = (mem_[0x47435] != 0 || ab > 0) ? std::clamp<int>(static_cast<int>(ab), 1, 5) : 0;
+    ab_stage = (mem_[p6 + profile_.ab_flag_off] != 0 || ab > 0) ? std::clamp<int>(static_cast<int>(ab), 1, 5) : 0;
     g_load = std::clamp(static_cast<float>(g10) * 0.1f, -4.0f, 12.0f);
 }
 
 void DosMachine::write_player_flight_state(const F16SimState& st, bool sync_forward_cam, bool write_throttle) {
+    const uint32_t p6  = profile_.player_6dof_addr;
+    const uint32_t ent = profile_.entity_array_addr;
+    const uint32_t cam = profile_.camera_addr;
     auto wr_u16 = [&](uint32_t addr, uint16_t v) {
         mem_[addr + 0] = static_cast<uint8_t>(v & 0xFF);
         mem_[addr + 1] = static_cast<uint8_t>(v >> 8);
@@ -2230,19 +2297,19 @@ void DosMachine::write_player_flight_state(const F16SimState& st, bool sync_forw
     uint16_t fp_yaw_b = deg_to_bam14(st.fp_yaw_deg);
     uint16_t fp_pitch_b = deg_to_bam14(st.fp_pitch_deg);
 
-    // 1. Player 6-DOF flight struct @ 0x47364
-    wr_i32(0x47364, wx);
-    wr_i32(0x47368, wy);
-    wr_u16(0x4736C, static_cast<uint16_t>(std::clamp(wz, 0, 65535)));
-    wr_u16(0x47370, yaw_b);
-    wr_u16(0x47372, pitch_b);
-    wr_u16(0x47374, roll_b);
-    wr_u16(0x47376, static_cast<uint16_t>(std::clamp(std::lround(st.mach * 100.0), 0L, 300L)));
-    wr_u16(0x47378, static_cast<uint16_t>(std::clamp(std::lround(st.kias), 0L, 1600L)));
+    // 1. Player 6-DOF flight struct
+    wr_i32(p6 + 0x00u, wx);
+    wr_i32(p6 + 0x04u, wy);
+    wr_u16(p6 + 0x08u, static_cast<uint16_t>(std::clamp(wz, 0, 65535)));
+    wr_u16(p6 + 0x0Cu, yaw_b);
+    wr_u16(p6 + 0x0Eu, pitch_b);
+    wr_u16(p6 + 0x10u, roll_b);
+    wr_u16(p6 + 0x12u, static_cast<uint16_t>(std::clamp(std::lround(st.mach * 100.0), 0L, 300L)));
+    wr_u16(p6 + 0x14u, static_cast<uint16_t>(std::clamp(std::lround(st.kias), 0L, 1600L)));
     if (write_throttle) {
         double t = std::clamp(st.throttle_cmd, 0.0, 1.0);
-        // Sync BOTH Falcon's real throttle command (0x47392: 0..183=IDLE..MIL, 183..305=AB1..AB5),
-        // AB stage (0x47382: 0..5), AB lamp flag (0x47435), and RPM display (0x4737C: 0..100)!
+        // Sync real throttle command (+0x2E: 0..183=IDLE..MIL, 183..305=AB1..AB5),
+        // AB stage (+0x1E: 0..5), AB lamp flag (+ab_flag_off), and RPM display (+0x18: 0..100)!
         uint16_t raw_thr = 0;
         uint16_t ab_stage = 0;
         if (t <= 0.78) {
@@ -2253,41 +2320,41 @@ void DosMachine::write_player_flight_state(const F16SimState& st, bool sync_forw
             raw_thr = static_cast<uint16_t>(std::lround(183.0 + ab_f * 122.0));
             ab_stage = static_cast<uint16_t>(std::clamp<long>(std::lround(1.0 + ab_f * 4.0), 1L, 5L));
         }
-        wr_u16(0x47392, raw_thr);
-        wr_u16(0x47382, ab_stage);
-        mem_[0x47435] = (ab_stage > 0) ? 0xFF : 0x00;
-        wr_u16(0x4737C, static_cast<uint16_t>(std::clamp(std::lround(st.rpm_pct), 0L, 100L)));
+        wr_u16(p6 + 0x2Eu, raw_thr);
+        wr_u16(p6 + 0x1Eu, ab_stage);
+        mem_[p6 + profile_.ab_flag_off] = (ab_stage > 0) ? 0xFF : 0x00;
+        wr_u16(p6 + 0x18u, static_cast<uint16_t>(std::clamp(std::lround(st.rpm_pct), 0L, 100L)));
     }
 
     // Roll rate, flight path velocity vector (for HUD velocity vector & EEGS gun funnel!), MSL/AGL, TAS, G-load
-    wr_i16(0x4739C, static_cast<int16_t>(std::clamp(std::lround(st.roll_rate_dps * 2.0), -1000L, 1000L)));
-    wr_u16(0x4739E, fp_yaw_b);
-    wr_u16(0x473A0, fp_pitch_b);
-    wr_u16(0x473A2, static_cast<uint16_t>(std::clamp(std::lround(st.alt_ft * 0.25), 0L, 20000L)));
-    wr_u16(0x473A4, static_cast<uint16_t>(std::clamp(std::lround(std::max(0.0, st.alt_ft - st.ground_alt_ft) * 0.25), 0L, 20000L)));
-    wr_u16(0x473B0, static_cast<uint16_t>(std::clamp(std::lround(st.tas_fps), 0L, 3000L)));
-    wr_i16(0x473B4, static_cast<int16_t>(std::clamp(std::lround(st.vn_fps * 0.25), -2000L, 2000L)));
-    wr_i16(0x473B6, static_cast<int16_t>(std::clamp(std::lround(st.ve_fps * 0.25), -2000L, 2000L)));
-    wr_i16(0x473B8, static_cast<int16_t>(std::clamp(std::lround(st.vu_fps * 0.25), -2000L, 2000L)));
-    wr_u16(0x473BA, static_cast<uint16_t>(std::clamp(wz, 0, 65535)));
-    wr_i16(0x47432, static_cast<int16_t>(std::clamp(std::lround(st.g_load * 10.0), -40L, 120L)));
+    wr_i16(p6 + 0x38u, static_cast<int16_t>(std::clamp(std::lround(st.roll_rate_dps * 2.0), -1000L, 1000L)));
+    wr_u16(p6 + 0x3Au, fp_yaw_b);
+    wr_u16(p6 + 0x3Cu, fp_pitch_b);
+    wr_u16(p6 + profile_.msl4_off, static_cast<uint16_t>(std::clamp(std::lround(st.alt_ft * 0.25), 0L, 20000L)));
+    wr_u16(p6 + profile_.agl4_off, static_cast<uint16_t>(std::clamp(std::lround(std::max(0.0, st.alt_ft - st.ground_alt_ft) * 0.25), 0L, 20000L)));
+    wr_u16(p6 + profile_.tas_off, static_cast<uint16_t>(std::clamp(std::lround(st.tas_fps), 0L, 3000L)));
+    wr_i16(p6 + profile_.vel_off + 0u, static_cast<int16_t>(std::clamp(std::lround(st.vn_fps * 0.25), -2000L, 2000L)));
+    wr_i16(p6 + profile_.vel_off + 2u, static_cast<int16_t>(std::clamp(std::lround(st.ve_fps * 0.25), -2000L, 2000L)));
+    wr_i16(p6 + profile_.vel_off + 4u, static_cast<int16_t>(std::clamp(std::lround(st.vu_fps * 0.25), -2000L, 2000L)));
+    wr_u16(p6 + profile_.vel_off + 6u, static_cast<uint16_t>(std::clamp(wz, 0, 65535)));
+    wr_i16(p6 + profile_.g_load_off, static_cast<int16_t>(std::clamp(std::lround(st.g_load * 10.0), -40L, 120L)));
 
-    // 2. Player 3D entity slot 0 @ 0x43AB4 (used by AI, radar, weapons, & external chase/orbit views!)
-    wr_i32(0x43AB4 + 0x00, wx);
-    wr_i32(0x43AB4 + 0x04, wy);
-    wr_i32(0x43AB4 + 0x08, wz);
-    wr_u16(0x43AB4 + 0x0C, yaw_b);
-    wr_u16(0x43AB4 + 0x0E, pitch_b);
-    wr_u16(0x43AB4 + 0x10, roll_b);
+    // 2. Player 3D entity slot 0 (used by AI, radar, weapons, & external chase/orbit views!)
+    wr_i32(ent + 0x00u, wx);
+    wr_i32(ent + 0x04u, wy);
+    wr_i32(ent + 0x08u, wz);
+    wr_u16(ent + 0x0Cu, yaw_b);
+    wr_u16(ent + 0x0Eu, pitch_b);
+    wr_u16(ent + 0x10u, roll_b);
 
-    // 3. Forward cockpit camera @ 0x45C10 (only override when sitting in forward cockpit so Chase/Padlock/Side views still work!)
+    // 3. Forward cockpit camera (only override when sitting in forward cockpit so Chase/Padlock/Side views still work!)
     if (sync_forward_cam) {
-        wr_i32(0x45C10 + 0x00, wx);
-        wr_i32(0x45C10 + 0x04, wy);
-        wr_i32(0x45C10 + 0x08, wz);
-        wr_u16(0x45C10 + 0x0C, yaw_b);
-        wr_u16(0x45C10 + 0x0E, pitch_b);
-        wr_u16(0x45C10 + 0x10, roll_b);
+        wr_i32(cam + 0x00u, wx);
+        wr_i32(cam + 0x04u, wy);
+        wr_i32(cam + 0x08u, wz);
+        wr_u16(cam + 0x0Cu, yaw_b);
+        wr_u16(cam + 0x0Eu, pitch_b);
+        wr_u16(cam + 0x10u, roll_b);
     }
 }
 
