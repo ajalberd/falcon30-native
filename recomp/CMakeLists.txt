@@ -121,6 +121,6 @@ target_link_libraries(falcon30_native PRIVATE
 if(WIN32)
     target_link_libraries(falcon30_native PRIVATE winmm ws2_32)
     if(MINGW)
-        target_link_options(falcon30_native PRIVATE -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic)
+        target_link_options(falcon30_native PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
 endif()
