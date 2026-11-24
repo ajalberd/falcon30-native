@@ -2883,18 +2883,25 @@ bool DosMachine::apply_auto_joystick_calibration(bool write_def_file, int force_
         return 0;
     };
 
+    auto joy_def_filename = [&]() -> const char* {
+        if (profile_.title == FalconTitle::Hornet) return "joystich.def";
+        if (profile_.title == FalconTitle::MiG29)  return "joysticm.def";
+        return "joystick.def";
+    };
+
     uint32_t base = find_joy_base();
     if (mode == 0) {
-        // All axes cleared or Keyboard Only requested -> disable Falcon's joystick driver cleanly
+        // All axes cleared or Keyboard Only requested -> disable joystick driver cleanly across Falcon/Hornet/MiG
         if (base != 0) {
             mem_[base + 0x66] = 0;
             mem_[base + 0x71] = 0;
             mem_[base + 0x72] = 0;
             mem_[base + 0x74] = 0;
+            mem_[base + 0x75] = 0; // Polling active flag (critical for Hornet & MiG-29!)
         }
         if (write_def_file && !game_dir_.empty()) {
             std::error_code ec;
-            fs::remove(fs::path(game_dir_) / "joystick.def", ec);
+            fs::remove(fs::path(game_dir_) / joy_def_filename(), ec);
         }
         return base != 0;
     }
@@ -2935,15 +2942,15 @@ bool DosMachine::apply_auto_joystick_calibration(bool write_def_file, int force_
     }
 
     if (write_def_file && !game_dir_.empty()) {
-        fs::path def_path = fs::path(game_dir_) / "joystick.def";
+        fs::path def_path = fs::path(game_dir_) / joy_def_filename();
         std::ofstream out(def_path, std::ios::binary | std::ios::trunc);
         if (out) {
             out.write(reinterpret_cast<const char*>(jdef.data()), static_cast<std::streamsize>(jdef.size()));
         }
     }
 
-    log("Auto-calibrated virtual gameport joystick (mode=" + std::to_string(mode) +
-        (base ? ", RAM patched" : "") + (write_def_file ? ", wrote joystick.def)" : ")"));
+    log(std::string("Auto-calibrated virtual gameport joystick (mode=") + std::to_string(mode) +
+        (base ? ", RAM patched" : "") + (write_def_file ? (std::string(", wrote ") + joy_def_filename() + ")") : ")"));
     return true;
 }
 

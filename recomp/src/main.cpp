@@ -465,6 +465,58 @@ const char* window_title_for_exe(const std::string& exe) {
     return "Falcon 3.0 Gold — Native Host (F-16C)";
 }
 
+const char* def_file_for_exe(const std::string& exe) {
+    std::string u = exe;
+    std::transform(u.begin(), u.end(), u.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (u.find("HORNET") != std::string::npos) return "HORNET.DEF";
+    if (u.find("MIG") != std::string::npos)    return "MIG29.DEF";
+    return "FALCON3.DEF";
+}
+
+fs::path find_case_insensitive_file(const std::string& dir, const char* target_name) {
+    std::error_code ec;
+    if (dir.empty() || !fs::exists(dir, ec)) return {};
+    std::string want = target_name;
+    std::transform(want.begin(), want.end(), want.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        std::string nm = entry.path().filename().string();
+        std::transform(nm.begin(), nm.end(), nm.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (nm == want) return entry.path();
+    }
+    return fs::path(dir) / target_name;
+}
+
+int read_def_flight_model(const std::string& game_dir, const char* def_name, int fallback = 2) {
+    fs::path p = find_case_insensitive_file(game_dir, def_name);
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return fallback;
+    uint8_t buf[16]{};
+    f.read(reinterpret_cast<char*>(buf), sizeof(buf));
+    if (f.gcount() < 8) return fallback;
+    uint16_t fm = static_cast<uint16_t>(buf[6] | (static_cast<uint16_t>(buf[7]) << 8));
+    return std::clamp<int>(static_cast<int>(fm), 0, 3);
+}
+
+bool write_def_flight_model(const std::string& game_dir, const char* def_name, int fm_level) {
+    fs::path p = find_case_insensitive_file(game_dir, def_name);
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return false;
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    if (data.size() < 8) return false;
+    uint16_t v = static_cast<uint16_t>(std::clamp(fm_level, 0, 3));
+    data[6] = static_cast<uint8_t>(v & 0xFF);
+    data[7] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+    return out.good();
+}
+
 enum class LauncherOutcome { Launch, Cancel, Quit };
 
 LauncherOutcome run_trilogy_launcher(SDL_Window* window,
@@ -475,6 +527,7 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                                      bool& show_launcher_on_startup,
                                      falcon::AudioEngine& audio,
                                      falcon::ModernRenderer& renderer,
+                                     falcon::F16FlightModel& flight_model,
                                      falcon::DosMachine& machine,
                                      falcon::HeadTracker& head_tracker,
                                      falcon::TimeCompSettings& time_comp) {
@@ -527,27 +580,49 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
     }
 
     bool avail[3] = {false, false, false};
+    int def_fm[3] = {2, 3, 2}; // In-game .DEF[+0x06] Flight Model per title (0=Simple,1=Mod,2=Complex,3=Hi-Fi)
     bool roms_ok = false;
     auto refresh_detection = [&]() {
         for (int i = 0; i < 3; ++i) {
             avail[i] = has_exe_in_dir(game_dir, kTitles[i].exe);
+            int fb = (i == 1) ? 3 : 2;
+            int fm = read_def_flight_model(game_dir, def_file_for_exe(kTitles[i].exe), fb);
+            if (i == 2 && fm > 2) fm = 2; // MIGCD.EXE has no HIFI overlay (max Complex)
+            def_fm[i] = fm;
         }
         roms_ok = has_mt32_roms_in(rom_dir);
     };
     refresh_detection();
 
+    // Open Launcher in a clean, compact 1024x768 centered window (restores saved game size on Launch/Resume!)
+    int prev_win_w = 1280, prev_win_h = 800;
+    SDL_GetWindowSize(window, &prev_win_w, &prev_win_h);
+    SDL_SetWindowSize(window, 1024, 768);
+    SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     SDL_SetWindowTitle(window, "Falcon 3.0 Gold — Trilogy Launcher");
+
+    auto commit_and_restore = [&](LauncherOutcome res) -> LauncherOutcome {
+        if (res == LauncherOutcome::Launch) {
+            int fm_val = (sel_idx == 2) ? std::min(def_fm[sel_idx], 2) : def_fm[sel_idx];
+            write_def_flight_model(game_dir, def_file_for_exe(kTitles[sel_idx].exe), fm_val);
+        }
+        if (res != LauncherOutcome::Quit) {
+            SDL_SetWindowSize(window, prev_win_w, prev_win_h);
+            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        }
+        return res;
+    };
 
     while (true) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             ImGui_ImplSDL3_ProcessEvent(&ev);
             if (ev.type == SDL_EVENT_QUIT) {
-                return LauncherOutcome::Quit;
+                return commit_and_restore(LauncherOutcome::Quit);
             }
             if (ev.type == SDL_EVENT_KEY_DOWN) {
                 if (ev.key.scancode == SDL_SCANCODE_ESCAPE && in_game_return) {
-                    return LauncherOutcome::Cancel;
+                    return commit_and_restore(LauncherOutcome::Cancel);
                 }
                 if (ev.key.scancode == SDL_SCANCODE_LEFT) {
                     sel_idx = (sel_idx + 2) % 3;
@@ -556,12 +631,12 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                 } else if ((ev.key.scancode == SDL_SCANCODE_RETURN || ev.key.scancode == SDL_SCANCODE_KP_ENTER) &&
                            avail[sel_idx]) {
                     selected_exe = kTitles[sel_idx].exe;
-                    return LauncherOutcome::Launch;
+                    return commit_and_restore(LauncherOutcome::Launch);
                 }
             }
         }
 
-        int win_w = 1280, win_h = 800;
+        int win_w = 1024, win_h = 768;
         SDL_GetWindowSize(window, &win_w, &win_h);
         glViewport(0, 0, win_w, win_h);
         glClearColor(0.045f, 0.065f, 0.098f, 1.0f);
@@ -573,7 +648,7 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
 
         ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(static_cast<float>(win_w), static_cast<float>(win_h)));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28.0f, 22.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 18.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.078f, 0.115f, 1.0f));
 
@@ -584,20 +659,20 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
 
         if (ImGui::Begin("##FalconGoldLauncher", nullptr, flags)) {
             const float avail_w = ImGui::GetContentRegionAvail().x;
-            const float content_w = std::min(avail_w, 1080.0f);
+            const float content_w = std::min(avail_w, 976.0f);
             const float left_pad = std::max(0.0f, (avail_w - content_w) * 0.5f);
             if (left_pad > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + left_pad);
 
             ImGui::BeginGroup();
 
             // Header Banner
-            ImGui::SetWindowFontScale(1.65f);
+            ImGui::SetWindowFontScale(1.55f);
             ImGui::TextColored(ImVec4(0.28f, 0.94f, 0.50f, 1.0f), "FALCON 3.0 GOLD");
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.88f, 0.92f, 0.98f, 1.0f), "NATIVE HOST");
             ImGui::SetWindowFontScale(1.0f);
             ImGui::TextColored(ImVec4(0.62f, 0.70f, 0.80f, 1.0f),
-                               "Select your aircraft & campaign package below  |  F11 Cycles 3D Mode  |  F12 In-Game Overlay  |  F9 Recenter Head");
+                               "Select your aircraft below  |  TAB Time Comp  |  F9 Head Recenter  |  F11 3D Mode  |  F12 Overlay");
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
@@ -606,8 +681,8 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             if (!avail[0] && !avail[1] && !avail[2]) {
                 ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.24f, 0.14f, 0.05f, 0.95f));
                 ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.95f, 0.65f, 0.18f, 1.0f));
-                ImGui::BeginChild("##NoGameWarn", ImVec2(content_w, 54.0f), ImGuiChildFlags_Borders);
-                ImGui::SetCursorPos(ImVec2(14.0f, 10.0f));
+                ImGui::BeginChild("##NoGameWarn", ImVec2(content_w, 50.0f), ImGuiChildFlags_Borders);
+                ImGui::SetCursorPos(ImVec2(14.0f, 8.0f));
                 ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.28f, 1.0f),
                                    "Falcon Gold game files not found in the current folder.");
                 ImGui::SetCursorPosX(14.0f);
@@ -619,9 +694,9 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             }
 
             // 3 Side-by-Side Aircraft Title Cards
-            const float card_gap = 16.0f;
+            const float card_gap = 14.0f;
             const float card_w = (content_w - 2.0f * card_gap) / 3.0f;
-            const float card_h = 228.0f;
+            const float card_h = 216.0f;
 
             for (int i = 0; i < 3; ++i) {
                 if (i > 0) ImGui::SameLine(0.0f, card_gap);
@@ -759,11 +834,11 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.075f, 0.102f, 0.148f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.26f, 0.35f, 0.90f));
             ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
-            ImGui::BeginChild("##QuickSettingsPanel", ImVec2(content_w, 148.0f), ImGuiChildFlags_Borders);
+            ImGui::BeginChild("##QuickSettingsPanel", ImVec2(content_w, 174.0f), ImGuiChildFlags_Borders);
             ImGui::SetCursorPos(ImVec2(14.0f, 10.0f));
             ImGui::TextColored(ImVec4(0.55f, 0.82f, 1.0f, 1.0f), "QUICK LAUNCH SETTINGS");
 
-            ImGui::SetCursorPos(ImVec2(14.0f, 38.0f));
+            ImGui::SetCursorPos(ImVec2(14.0f, 36.0f));
             ImGui::BeginGroup();
             int rmode = static_cast<int>(renderer.mode());
             const char* rmodes[] = {
@@ -772,9 +847,25 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                 "Hybrid Cockpit (HD 3D + 2D HUD)",
                 "VR Stereo Preview (Side-by-Side)"
             };
-            ImGui::SetNextItemWidth(320.0f);
+            ImGui::SetNextItemWidth(275.0f);
             if (ImGui::Combo("Render Mode", &rmode, rmodes, 4)) {
                 renderer.mode() = static_cast<falcon::RenderMode>(rmode);
+            }
+
+            // In-Game DOS Flight Model (saved straight to FALCON3.DEF / HORNET.DEF / MIG29.DEF [+0x06]!)
+            ImGui::SetNextItemWidth(275.0f);
+            if (sel_idx == 2) {
+                const char* mig_fms[] = { "Simple", "Moderate", "Complex (Max for MiG-29)" };
+                int fm = std::clamp(def_fm[2], 0, 2);
+                if (ImGui::Combo("DOS Flight Model", &fm, mig_fms, 3)) {
+                    def_fm[2] = fm;
+                }
+            } else {
+                const char* fms[] = { "Simple", "Moderate", "Complex", "Hi-Fidelity (80387 FPU)" };
+                int fm = std::clamp(def_fm[sel_idx], 0, 3);
+                if (ImGui::Combo("DOS Flight Model", &fm, fms, 4)) {
+                    def_fm[sel_idx] = fm;
+                }
             }
 
             int sam = static_cast<int>(machine.sam_mod_preset());
@@ -784,23 +875,23 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                 "Early Strela (SA-7A)",
                 "Low Threat / Training"
             };
-            ImGui::SetNextItemWidth(320.0f);
+            ImGui::SetNextItemWidth(275.0f);
             if (ImGui::Combo("SAM Realism", &sam, sams, 4)) {
                 machine.set_sam_mod_preset(static_cast<falcon::SamModPreset>(sam));
             }
 
             int tcm = static_cast<int>(time_comp.mode);
             const char* tcms[] = {
-                "Tap TAB to Cycle (1x / 2x / 4x / 8x)",
+                "Tap TAB to Cycle (1x-8x)",
                 "Hold TAB for Smooth Boost"
             };
-            ImGui::SetNextItemWidth(320.0f);
+            ImGui::SetNextItemWidth(275.0f);
             if (ImGui::Combo("Time Comp (TAB)", &tcm, tcms, 2)) {
                 time_comp.mode = static_cast<falcon::TimeCompMode>(tcm);
             }
             ImGui::EndGroup();
 
-            ImGui::SameLine(465.0f);
+            ImGui::SameLine(430.0f);
             ImGui::BeginGroup();
             ImGui::Checkbox("Fill Widescreen 3D World", &renderer.vr_config().hybrid_fill_widescreen);
             bool skip_intro = machine.skip_intro();
@@ -811,11 +902,15 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             ImGui::Checkbox("Auto-Drop Time Comp on Threat", &time_comp.auto_drop);
             ImGui::EndGroup();
 
-            ImGui::SameLine(745.0f);
+            ImGui::SameLine(705.0f);
             ImGui::BeginGroup();
-            ImGui::Checkbox("OpenTrack Head Tracking (UDP 4242)", &head_tracker.config().enabled);
+            ImGui::Checkbox("OpenTrack Head Tracking (4242)", &head_tracker.config().enabled);
             ImGui::Checkbox("3D Virtual Cockpit Free-Look", &renderer.vr_config().virtual_cockpit_freelook);
             ImGui::Checkbox("Unclamped 3D Padlock ('8')", &renderer.vr_config().enhanced_3d_padlock);
+            ImGui::Checkbox("Native 240Hz F-16C FM Mod", &flight_model.config().enabled);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Optional C++ NASA F-16C flight model (overrides DOS physics).\nLeave unchecked to fly authentic DOS Complex / Hi-Fidelity 80387 FM.");
+            }
             ImGui::EndGroup();
 
             ImGui::EndChild();
@@ -872,7 +967,7 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
         SDL_GL_SwapWindow(window);
 
         if (decided) {
-            return outcome;
+            return commit_and_restore(outcome);
         }
     }
 }
@@ -1184,9 +1279,12 @@ int main(int argc, char** argv) {
                                  (show_launcher_on_startup && !explicit_exe && !skip_launcher_cli);
     if (open_startup_launcher) {
         LauncherOutcome lo = run_trilogy_launcher(window, false, game_dir, rom_dir, exe_name,
-                                                  show_launcher_on_startup, audio, renderer, machine, head_tracker, time_comp);
+                                                  show_launcher_on_startup, audio, renderer, flight_model, machine, head_tracker, time_comp);
         if (lo == LauncherOutcome::Quit) {
-            save_settings_now();
+            cfg_dir = resolve_config_dir(game_dir);
+            config_path = (cfg_dir / "falcon3_config.json").string();
+            save_host_settings(config_path, game_dir, audio, renderer, flight_model, machine, head_tracker,
+                               init_win_w, init_win_h, show_launcher_on_startup, exe_name, time_comp);
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplSDL3_Shutdown();
             ImGui::DestroyContext();
@@ -1305,7 +1403,7 @@ int main(int argc, char** argv) {
             std::string prev_rom_dir = rom_dir;
             std::string chosen_exe = machine.current_exe();
             LauncherOutcome lo = run_trilogy_launcher(window, true, game_dir, rom_dir, chosen_exe,
-                                                      show_launcher_on_startup, audio, renderer, machine, head_tracker, time_comp);
+                                                      show_launcher_on_startup, audio, renderer, flight_model, machine, head_tracker, time_comp);
             if (lo == LauncherOutcome::Quit) {
                 running = false;
                 break;
