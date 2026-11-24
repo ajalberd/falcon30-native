@@ -13,12 +13,26 @@
 
 namespace falcon {
 
+enum class TimeCompMode : int {
+    TapToCycle  = 0, // Tap TAB: 1x -> 2x -> 4x -> 8x -> 1x (Shift+TAB steps down)
+    HoldToBoost = 1  // Hold TAB: smooth Nx boost while held, instant 1x on release
+};
+
+struct TimeCompSettings {
+    TimeCompMode mode = TimeCompMode::TapToCycle;
+    float hold_mult = 4.0f;    // 2.0, 4.0, or 8.0 when in HoldToBoost mode
+    bool auto_drop = true;     // Auto-drop to 1x on missile threat, low AGL descent, or weapon fire
+    std::string alert_text;    // Brief amber status message on auto-drop
+    double alert_until_sec = 0.0;
+};
+
 class OverlayUI {
 public:
     OverlayUI(DosMachine& machine, AudioEngine& audio, HotasMapper& hotas,
               NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model,
               HeadTracker& head_tracker, std::function<bool()> save_settings_cb = {},
-              std::function<void()> open_launcher_cb = {}, bool* show_launcher_ptr = nullptr);
+              std::function<void()> open_launcher_cb = {}, bool* show_launcher_ptr = nullptr,
+              TimeCompSettings* time_comp_ptr = nullptr);
 
     void draw(const FlightTelemetry& tel, double now_sec = 0.0);
 
@@ -37,6 +51,7 @@ private:
     std::function<bool()> save_settings_cb_;
     std::function<void()> open_launcher_cb_;
     bool* show_launcher_ptr_ = nullptr;
+    TimeCompSettings* time_comp_ptr_ = nullptr;
     double now_sec_ = 0.0;
     std::string config_status_;
 

@@ -2,6 +2,7 @@
 
 #include "audio/audio_engine.h"
 #include "dos/vga.h"
+#include "dos/x87_fpu.h"
 #include "input/hotas_mapper.h"
 #include "net/net_udp.h"
 #include "render/modern_renderer.h"
@@ -166,6 +167,10 @@ public:
     bool auto_turbo() const { return auto_turbo_in_flight_; }
     uint64_t effective_cpu_speed_ips() const;
 
+    // Smooth host-driven Time Compression multiplier (1.0x .. 8.0x in flight, always 1.0x in menus)
+    void set_time_scale(float scale) { time_scale_ = (scale >= 1.0f && scale <= 8.0f) ? scale : 1.0f; }
+    float time_scale() const { return time_scale_; }
+
     // Skip intro video & credits automatically (fast-boots straight to War Room menu!)
     void set_skip_intro(bool enabled) { skip_intro_enabled_ = enabled; }
     bool skip_intro() const { return skip_intro_enabled_; }
@@ -183,6 +188,8 @@ public:
 
     CpuSnapshot snapshot() const;
     const VgaDevice& vga() const { return vga_; }
+    uint64_t fpu_ops_executed() const { return fpu_.ops_executed(); }
+    uint64_t fpu_unknown_ops() const { return fpu_.unknown_ops(); }
     const std::deque<std::string>& log_lines() const { return log_lines_; }
     const uint8_t* raw_memory() const { return mem_.data(); }
 
@@ -227,6 +234,7 @@ private:
     HotasMapper& hotas_;
     NetUdp& net_;
     VgaDevice vga_;
+    X87Fpu fpu_;
 
     x86emu_t* emu_ = nullptr;
     std::vector<uint8_t> mem_;
@@ -285,6 +293,7 @@ private:
     uint64_t cpu_speed_ips_ = 3500000ULL;
     uint64_t flight_cpu_speed_ips_ = 20000000ULL;
     bool auto_turbo_in_flight_ = true;
+    float time_scale_ = 1.0f;
     double pit_time_accum_ = 0.0;
     double bda_time_accum_ = 0.0;
     double vga_time_accum_ = 0.0;

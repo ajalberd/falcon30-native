@@ -96,6 +96,7 @@ add_executable(falcon30_native
     src/main.cpp
     src/dos/vga.cpp
     src/dos/dos_machine.cpp
+    src/dos/x87_fpu.cpp
     src/audio/audio_engine.cpp
     src/input/head_tracker.cpp
     src/input/hotas_mapper.cpp

@@ -23,17 +23,52 @@ const char* hat_dir_name(uint8_t mask) {
 OverlayUI::OverlayUI(DosMachine& machine, AudioEngine& audio, HotasMapper& hotas,
                      NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model,
                      HeadTracker& head_tracker, std::function<bool()> save_settings_cb,
-                     std::function<void()> open_launcher_cb, bool* show_launcher_ptr)
+                     std::function<void()> open_launcher_cb, bool* show_launcher_ptr,
+                     TimeCompSettings* time_comp_ptr)
     : machine_(machine), audio_(audio), hotas_(hotas), net_(net),
       renderer_(renderer), flight_model_(flight_model), head_tracker_(head_tracker),
       save_settings_cb_(std::move(save_settings_cb)),
       open_launcher_cb_(std::move(open_launcher_cb)),
-      show_launcher_ptr_(show_launcher_ptr) {
+      show_launcher_ptr_(show_launcher_ptr),
+      time_comp_ptr_(time_comp_ptr) {
     std::snprintf(rom_dir_buf_, sizeof(rom_dir_buf_), "%s", audio_.config().cm32l_rom_dir.c_str());
 }
 
 void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
     now_sec_ = now_sec;
+
+    // Always draw crisp corner Time Compression pill when active (>1x) or on brief Auto-Drop alert (even if F12 is hidden!)
+    {
+        float ts = tel.in_flight ? machine_.time_scale() : 1.0f;
+        bool show_alert = (time_comp_ptr_ && !time_comp_ptr_->alert_text.empty() && now_sec < time_comp_ptr_->alert_until_sec);
+        if (ts > 1.01f || show_alert) {
+            ImGuiIO& io = ImGui::GetIO();
+            float top_y = visible_ ? 28.0f : 10.0f;
+            ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 14.0f, top_y), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.08f, 0.12f, 0.82f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ts > 1.01f ? ImVec4(0.25f, 0.95f, 0.48f, 0.90f) : ImVec4(0.98f, 0.72f, 0.20f, 0.95f));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 5.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 5.0f));
+            ImGuiWindowFlags pf = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                                  ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+            if (ImGui::Begin("##TimeCompBadge", nullptr, pf)) {
+                if (ts > 1.01f) {
+                    const char* hint = (time_comp_ptr_ && time_comp_ptr_->mode == TimeCompMode::HoldToBoost)
+                                           ? "Release TAB -> 1x" : "TAB cycle | Shift+TAB down";
+                    ImGui::TextColored(ImVec4(0.30f, 0.98f, 0.50f, 1.0f), "TIME %.0fx", ts);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%s)", hint);
+                } else if (show_alert) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.24f, 1.0f), "%s", time_comp_ptr_->alert_text.c_str());
+                }
+            }
+            ImGui::End();
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(2);
+        }
+    }
+
     if (!visible_) return;
 
     if (ImGui::BeginMainMenuBar()) {
@@ -52,6 +87,32 @@ void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
             }
             if (open_launcher_cb_ && ImGui::MenuItem("Return to Trilogy Launcher...")) {
                 open_launcher_cb_();
+            }
+            if (time_comp_ptr_ && ImGui::BeginMenu("Time Compression (TAB)")) {
+                bool is_tap  = (time_comp_ptr_->mode == TimeCompMode::TapToCycle);
+                bool is_hold = (time_comp_ptr_->mode == TimeCompMode::HoldToBoost);
+                if (ImGui::MenuItem("Tap TAB to Cycle (1x / 2x / 4x / 8x)", nullptr, is_tap)) {
+                    time_comp_ptr_->mode = TimeCompMode::TapToCycle;
+                }
+                if (ImGui::MenuItem("Hold TAB for Smooth Boost", nullptr, is_hold)) {
+                    time_comp_ptr_->mode = TimeCompMode::HoldToBoost;
+                    machine_.set_time_scale(1.0f);
+                }
+                if (is_hold) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Hold Boost: 2x", nullptr, time_comp_ptr_->hold_mult == 2.0f)) time_comp_ptr_->hold_mult = 2.0f;
+                    if (ImGui::MenuItem("Hold Boost: 4x", nullptr, time_comp_ptr_->hold_mult == 4.0f)) time_comp_ptr_->hold_mult = 4.0f;
+                    if (ImGui::MenuItem("Hold Boost: 8x", nullptr, time_comp_ptr_->hold_mult == 8.0f)) time_comp_ptr_->hold_mult = 8.0f;
+                }
+                ImGui::Separator();
+                ImGui::MenuItem("Auto-Drop to 1x on Missile / Low Alt / Fire", nullptr, &time_comp_ptr_->auto_drop);
+                ImGui::Separator();
+                float cur = machine_.time_scale();
+                if (ImGui::MenuItem("Set 1x (Normal)", nullptr, cur < 1.5f)) machine_.set_time_scale(1.0f);
+                if (ImGui::MenuItem("Set 2x", nullptr, cur >= 1.5f && cur < 3.0f)) machine_.set_time_scale(2.0f);
+                if (ImGui::MenuItem("Set 4x", nullptr, cur >= 3.0f && cur < 6.0f)) machine_.set_time_scale(4.0f);
+                if (ImGui::MenuItem("Set 8x", nullptr, cur >= 6.0f)) machine_.set_time_scale(8.0f);
+                ImGui::EndMenu();
             }
             ImGui::Separator();
             if (show_launcher_ptr_) {

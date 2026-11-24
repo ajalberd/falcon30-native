@@ -133,7 +133,8 @@ void DosMachine::reset() {
     std::memcpy(&mem_[(static_cast<uint32_t>(kEmmStubSeg) << 4) + 0x000A], emm_sig, 8);
 
     // Populate BIOS Data Area (BDA at 0040:0000)
-    mem_write16(0x0410, 0x0021); // Equipment word: VGA, no FPU initially
+    fpu_.reset();
+    mem_write16(0x0410, 0x0023); // Equipment word: VGA + 80387 Math Coprocessor present!
     mem_write16(0x0413, 640);    // 640 KB conventional memory
     mem_write8(0x0449, 0x03);    // Video mode 03h
     mem_write16(0x044A, 80);     // Columns
@@ -615,20 +616,12 @@ int DosMachine::handle_intr(x86emu_t* /*emu*/, uint8_t num, unsigned /*type*/) {
 
     switch (num) {
         case 0x06: {
-            // libx86emu raises INT 6 on 8087 FPU ESC opcodes (0xD8..0xDF).
-            // Decode ModRM length so IP advances cleanly past the FPU instruction
-            // (reports "no 8087" until we enable full 8087 FPU emulation).
-            uint32_t pc = (static_cast<uint32_t>(emu_->x86.R_CS) << 4) + emu_->x86.R_IP;
-            uint8_t prev = mem_read8(pc - 1);
+            // libx86emu raises INT 6 (#UD) on x87 FPU ESC opcodes (0xD8..0xDF).
+            // Dispatch straight to our IEEE-754 80387 FPU emulator (unlocks HI-FIDELITY flight model!).
+            uint32_t pc = ((static_cast<uint32_t>(emu_->x86.R_CS) << 4) + emu_->x86.R_IP) & 0xFFFFFu;
+            uint8_t prev = mem_read8((pc - 1) & 0xFFFFFu);
             if (prev >= 0xD8 && prev <= 0xDF) {
-                uint8_t modrm = mem_read8(pc);
-                uint8_t mod = (modrm >> 6) & 3;
-                uint8_t rm = modrm & 7;
-                uint16_t extra = 1; // ModRM byte itself
-                if (mod == 0 && rm == 6) extra += 2;
-                else if (mod == 1) extra += 1;
-                else if (mod == 2) extra += 2;
-                emu_->x86.R_IP = static_cast<uint16_t>(emu_->x86.R_IP + extra);
+                fpu_.execute(emu_, mem_.data(), MEM_SIZE, prev);
                 return 1;
             }
             std::ostringstream oss;
@@ -2626,8 +2619,13 @@ uint64_t DosMachine::step_realtime(double dt_sec) {
 
     poll_ipx_udp();
 
-    // 2. Real-time BIOS Data Area timer (18.2065 Hz)
-    bda_time_accum_ += dt_sec;
+    // Smooth host-driven Time Compression (1x..8x): scale simulated DOS clocks & CPU budget cleanly in flight!
+    bool apply_tc = (time_scale_ > 1.01f) && (in_3d_flight_session_ || read_flight_telemetry().in_flight);
+    double tc = apply_tc ? static_cast<double>(std::clamp(time_scale_, 1.0f, 8.0f)) : 1.0;
+    double sim_dt = std::min(dt_sec * tc, 0.40);
+
+    // 2. Real-time BIOS Data Area timer (18.2065 Hz, scaled by Time Compression)
+    bda_time_accum_ += sim_dt;
     constexpr double kBdaPeriod = 1.0 / 18.2065;
     while (bda_time_accum_ >= kBdaPeriod) {
         bda_time_accum_ -= kBdaPeriod;
@@ -2639,8 +2637,12 @@ uint64_t DosMachine::step_realtime(double dt_sec) {
     // 3. Real-time CPU budget (auto-turbo in flight!) + real-time PIT IRQ0 + per-slice VGA 70.08Hz vblank phase
     constexpr double kVgaPeriod = 1.0 / 70.08;
     uint64_t active_ips = effective_cpu_speed_ips();
-    insn_budget_accum_ += dt_sec * static_cast<double>(active_ips);
-    uint64_t max_burst = active_ips / 20; // Cap burst at 50ms worth of insns
+    // During Time Compression (2x..8x), cap per-simulated-second CPU rate to ~9 MIPS (still faster than a 486DX-33!)
+    // so 4x/8x advance smoothly at 60 FPS without saturating a single CPU core!
+    uint64_t sim_ips = apply_tc ? std::min<uint64_t>(active_ips, 9000000ULL) : active_ips;
+    insn_budget_accum_ += sim_dt * static_cast<double>(sim_ips);
+    uint64_t max_burst = std::max<uint64_t>(active_ips / 20,
+                                            static_cast<uint64_t>(static_cast<double>(sim_ips) * tc / 16.0));
     if (insn_budget_accum_ > static_cast<double>(max_burst)) {
         insn_budget_accum_ = static_cast<double>(max_burst);
     }
@@ -2649,38 +2651,39 @@ uint64_t DosMachine::step_realtime(double dt_sec) {
 
     uint32_t reload = (pit_reload0_ == 0) ? 65536u : static_cast<uint32_t>(pit_reload0_);
     double pit_period = static_cast<double>(reload) / 1193182.0;
-    pit_time_accum_ += dt_sec;
+    pit_time_accum_ += sim_dt;
 
     // Support high-frequency PIT0 interrupts up to ~30 kHz (Falcon 3.0 drives
     // Sound Blaster Direct DAC 0x10 voice comms at 11,256.4 Hz = ~188 ticks/16.6ms!)
     int irqs_due = 0;
-    while (pit_time_accum_ >= pit_period && irqs_due < 512) {
+    int max_irqs = apply_tc ? 768 : 512;
+    while (pit_time_accum_ >= pit_period && irqs_due < max_irqs) {
         pit_time_accum_ -= pit_period;
         irqs_due++;
     }
-    if (pit_time_accum_ > 0.030) pit_time_accum_ = 0.0;
+    if (pit_time_accum_ > 0.030 * tc) pit_time_accum_ = 0.0;
 
-    int slices = std::max(8, irqs_due);
-    double slice_dt = dt_sec / static_cast<double>(slices);
+    int slices = std::max(apply_tc ? static_cast<int>(8 * tc) : 8, irqs_due);
+    double slice_dt = sim_dt / static_cast<double>(slices);
     uint64_t done = 0;
     uint64_t slice_insns = std::max<uint64_t>(80, target_insns / static_cast<uint64_t>(slices));
 
+    const int64_t soft_budget_us = apply_tc ? 13000 : 11000;
+    const int64_t hard_budget_us = apply_tc ? 15000 : 13000;
     for (int s = 0; s < slices && !paused_ && !exited_; ++s) {
-        // Wall-clock guardrail: never spend >11ms in CPU stepping so host 60+ FPS stays smooth!
-        // If high-rate Direct DAC PIT ticks remain, keep delivering their tiny ~100-insn ISRs
-        // (up to 13ms hard cap) so voice comms stay 100% glitch-free.
+        // Wall-clock guardrail: never spend >11-15ms in CPU stepping so host 60+ FPS stays smooth!
         bool over_soft_budget = false;
         if (s > 0 && (s & 3) == 0) {
             auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                   std::chrono::steady_clock::now() - wall_start).count();
-            if (elapsed_us > 13000) {
-                // Return undelivered PIT ticks back to accumulator (up to 25ms)
+            if (elapsed_us > hard_budget_us) {
+                // Return undelivered PIT ticks back to accumulator
                 if (s < irqs_due) {
-                    pit_time_accum_ = std::min(0.025, pit_time_accum_ + static_cast<double>(irqs_due - s) * pit_period);
+                    pit_time_accum_ = std::min(0.025 * tc, pit_time_accum_ + static_cast<double>(irqs_due - s) * pit_period);
                 }
                 break;
             }
-            if (elapsed_us > 11000) {
+            if (elapsed_us > soft_budget_us) {
                 if (s >= irqs_due) break;
                 over_soft_budget = true;
             }

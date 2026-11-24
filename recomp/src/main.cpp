@@ -210,7 +210,8 @@ bool load_host_settings(const std::string& path,
                         int& init_win_w,
                         int& init_win_h,
                         bool& show_launcher_on_startup,
-                        std::string& last_exe) {
+                        std::string& last_exe,
+                        falcon::TimeCompSettings& time_comp) {
     std::ifstream in(path);
     if (!in) return false;
     try {
@@ -311,6 +312,16 @@ bool load_host_settings(const std::string& path,
                 std::string le = h["last_exe"].get<std::string>();
                 if (!le.empty()) last_exe = le;
             }
+            if (h.contains("time_comp_mode")) {
+                time_comp.mode = static_cast<falcon::TimeCompMode>(std::clamp(h["time_comp_mode"].get<int>(), 0, 1));
+            }
+            if (h.contains("time_comp_hold_mult")) {
+                float hm = h["time_comp_hold_mult"].get<float>();
+                time_comp.hold_mult = (hm >= 6.0f) ? 8.0f : (hm >= 3.0f ? 4.0f : 2.0f);
+            }
+            if (h.contains("time_comp_auto_drop")) {
+                time_comp.auto_drop = h["time_comp_auto_drop"].get<bool>();
+            }
             if (h.contains("window_w")) init_win_w = std::clamp(h["window_w"].get<int>(), 640, 7680);
             if (h.contains("window_h")) init_win_h = std::clamp(h["window_h"].get<int>(), 480, 4320);
         }
@@ -330,7 +341,8 @@ bool save_host_settings(const std::string& path,
                         int win_w,
                         int win_h,
                         bool show_launcher_on_startup,
-                        const std::string& last_exe) {
+                        const std::string& last_exe,
+                        const falcon::TimeCompSettings& time_comp) {
     try {
         nlohmann::json j;
         const auto& ac = audio.config();
@@ -413,6 +425,9 @@ bool save_host_settings(const std::string& path,
             {"sam_mod_preset", static_cast<int>(machine.sam_mod_preset())},
             {"show_launcher_on_startup", show_launcher_on_startup},
             {"last_exe", last_exe},
+            {"time_comp_mode", static_cast<int>(time_comp.mode)},
+            {"time_comp_hold_mult", time_comp.hold_mult},
+            {"time_comp_auto_drop", time_comp.auto_drop},
             {"window_w", win_w},
             {"window_h", win_h},
         };
@@ -461,7 +476,8 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                                      falcon::AudioEngine& audio,
                                      falcon::ModernRenderer& renderer,
                                      falcon::DosMachine& machine,
-                                     falcon::HeadTracker& head_tracker) {
+                                     falcon::HeadTracker& head_tracker,
+                                     falcon::TimeCompSettings& time_comp) {
     struct TitleEntry {
         const char* exe;
         const char* title;
@@ -743,7 +759,7 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.075f, 0.102f, 0.148f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.26f, 0.35f, 0.90f));
             ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
-            ImGui::BeginChild("##QuickSettingsPanel", ImVec2(content_w, 120.0f), ImGuiChildFlags_Borders);
+            ImGui::BeginChild("##QuickSettingsPanel", ImVec2(content_w, 148.0f), ImGuiChildFlags_Borders);
             ImGui::SetCursorPos(ImVec2(14.0f, 10.0f));
             ImGui::TextColored(ImVec4(0.55f, 0.82f, 1.0f, 1.0f), "QUICK LAUNCH SETTINGS");
 
@@ -772,6 +788,16 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             if (ImGui::Combo("SAM Realism", &sam, sams, 4)) {
                 machine.set_sam_mod_preset(static_cast<falcon::SamModPreset>(sam));
             }
+
+            int tcm = static_cast<int>(time_comp.mode);
+            const char* tcms[] = {
+                "Tap TAB to Cycle (1x / 2x / 4x / 8x)",
+                "Hold TAB for Smooth Boost"
+            };
+            ImGui::SetNextItemWidth(320.0f);
+            if (ImGui::Combo("Time Comp (TAB)", &tcm, tcms, 2)) {
+                time_comp.mode = static_cast<falcon::TimeCompMode>(tcm);
+            }
             ImGui::EndGroup();
 
             ImGui::SameLine(465.0f);
@@ -782,6 +808,7 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                 machine.set_skip_intro(skip_intro);
             }
             ImGui::Checkbox("Show Launcher on Startup", &show_launcher_on_startup);
+            ImGui::Checkbox("Auto-Drop Time Comp on Threat", &time_comp.auto_drop);
             ImGui::EndGroup();
 
             ImGui::SameLine(745.0f);
@@ -976,13 +1003,15 @@ int main(int argc, char** argv) {
             }
         }
         auto snap = machine.snapshot();
-        std::printf("Headless done: insns=%llu CS:IP=%04X:%04X VGA=0x%02X EMS=%d/%d exited=%d MIDI_rx=%llu SysEx=%llu SB_DAC=%llu\n",
+        std::printf("Headless done: insns=%llu CS:IP=%04X:%04X VGA=0x%02X EMS=%d/%d exited=%d MIDI_rx=%llu SysEx=%llu SB_DAC=%llu FPU_ops=%llu(unk=%llu)\n",
                     static_cast<unsigned long long>(snap.total_insns),
                     snap.cs, snap.ip, machine.vga().mode(),
                     snap.ems_pages_used, snap.ems_pages_total, snap.exited ? 1 : 0,
                     static_cast<unsigned long long>(audio.midi_bytes_received()),
                     static_cast<unsigned long long>(audio.sysex_messages_received()),
-                    static_cast<unsigned long long>(audio.sb_dac_samples_received()));
+                    static_cast<unsigned long long>(audio.sb_dac_samples_received()),
+                    static_cast<unsigned long long>(machine.fpu_ops_executed()),
+                    static_cast<unsigned long long>(machine.fpu_unknown_ops()));
         uint32_t m6882 = 0x68820;
         std::printf("6882:0426=%04X 6882:0418=%04X\n",
                     machine.raw_memory()[m6882 + 0x0426] | (machine.raw_memory()[m6882 + 0x0427] << 8),
@@ -1126,8 +1155,9 @@ int main(int argc, char** argv) {
     int init_win_w = 1280, init_win_h = 800;
     bool show_launcher_on_startup = true;
     std::string last_exe = "FALCONCD.EXE";
+    falcon::TimeCompSettings time_comp;
     load_host_settings(config_path, explicit_rom_dir, audio, renderer, flight_model, machine, head_tracker,
-                       init_win_w, init_win_h, show_launcher_on_startup, last_exe);
+                       init_win_w, init_win_h, show_launcher_on_startup, last_exe, time_comp);
     if (!explicit_exe && !last_exe.empty()) {
         exe_name = last_exe;
     }
@@ -1146,7 +1176,7 @@ int main(int argc, char** argv) {
         cfg_dir = resolve_config_dir(game_dir);
         config_path = (cfg_dir / "falcon3_config.json").string();
         return save_host_settings(config_path, game_dir, audio, renderer, flight_model, machine, head_tracker,
-                                  cw, ch, show_launcher_on_startup, exe_name);
+                                  cw, ch, show_launcher_on_startup, exe_name, time_comp);
     };
 
     bool missing_game = resolve_falcon_dir(game_dir).empty() || !has_exe_in_dir(game_dir, exe_name.c_str());
@@ -1154,7 +1184,7 @@ int main(int argc, char** argv) {
                                  (show_launcher_on_startup && !explicit_exe && !skip_launcher_cli);
     if (open_startup_launcher) {
         LauncherOutcome lo = run_trilogy_launcher(window, false, game_dir, rom_dir, exe_name,
-                                                  show_launcher_on_startup, audio, renderer, machine, head_tracker);
+                                                  show_launcher_on_startup, audio, renderer, machine, head_tracker, time_comp);
         if (lo == LauncherOutcome::Quit) {
             save_settings_now();
             ImGui_ImplOpenGL3_Shutdown();
@@ -1199,7 +1229,8 @@ int main(int argc, char** argv) {
     falcon::OverlayUI ui(machine, audio, hotas, net, renderer, flight_model, head_tracker,
                          save_settings_now,
                          [&]() { return_to_launcher_requested = true; },
-                         &show_launcher_on_startup);
+                         &show_launcher_on_startup,
+                         &time_comp);
 
     // OpenGL texture for 320x400 VGA framebuffer (supports both 320x200 and 320x400 Mode X!)
     GLuint vga_tex = 0, vga_cockpit_tex = 0, vga_hud_tex = 0;
@@ -1269,11 +1300,12 @@ int main(int argc, char** argv) {
     while (running) {
         if (return_to_launcher_requested) {
             return_to_launcher_requested = false;
+            machine.set_time_scale(1.0f);
             std::string prev_game_dir = game_dir;
             std::string prev_rom_dir = rom_dir;
             std::string chosen_exe = machine.current_exe();
             LauncherOutcome lo = run_trilogy_launcher(window, true, game_dir, rom_dir, chosen_exe,
-                                                      show_launcher_on_startup, audio, renderer, machine, head_tracker);
+                                                      show_launcher_on_startup, audio, renderer, machine, head_tracker, time_comp);
             if (lo == LauncherOutcome::Quit) {
                 running = false;
                 break;
@@ -1411,7 +1443,50 @@ int main(int argc, char** argv) {
                             renderer.vr_config().head_pitch_deg = 0.0f;
                         }
                     }
+                    if (ev.key.scancode == SDL_SCANCODE_TAB) {
+                        bool ctrl_held  = (ev.key.mod & SDL_KMOD_CTRL) != 0;
+                        bool shift_held = (ev.key.mod & SDL_KMOD_SHIFT) != 0;
+                        if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.repeat) {
+                            // Never spam DOS or host time-compression with OS key-repeat!
+                            suppress_dos_key = true;
+                        } else if (prev_in_flight && !machine.paused() && !ctrl_held) {
+                            // Smooth Host-Driven Time Compression (1x / 2x / 4x / 8x) — full 60 FPS 3D!
+                            // (Hold Ctrl+TAB if you ever want DOS's legacy skip-render warp.)
+                            suppress_dos_key = true;
+                            if (time_comp.mode == falcon::TimeCompMode::TapToCycle) {
+                                if (ev.type == SDL_EVENT_KEY_DOWN) {
+                                    float cur = machine.time_scale();
+                                    float nxt = 1.0f;
+                                    if (shift_held) {
+                                        if (cur >= 6.0f) nxt = 4.0f;
+                                        else if (cur >= 3.0f) nxt = 2.0f;
+                                        else nxt = 1.0f;
+                                    } else {
+                                        if (cur < 1.5f) nxt = 2.0f;
+                                        else if (cur < 3.0f) nxt = 4.0f;
+                                        else if (cur < 6.0f) nxt = 8.0f;
+                                        else nxt = 1.0f;
+                                    }
+                                    machine.set_time_scale(nxt);
+                                    time_comp.alert_text.clear();
+                                }
+                            } else {
+                                // HoldToBoost: smooth Nx while TAB is held, instant 1x on release!
+                                if (ev.type == SDL_EVENT_KEY_DOWN) {
+                                    machine.set_time_scale(time_comp.hold_mult);
+                                    time_comp.alert_text.clear();
+                                } else if (ev.type == SDL_EVENT_KEY_UP) {
+                                    machine.set_time_scale(1.0f);
+                                }
+                            }
+                        }
+                    }
                     if (ev.key.scancode == SDL_SCANCODE_SPACE && prev_in_flight && !machine.paused()) {
+                        if (ev.type == SDL_EVENT_KEY_DOWN && time_comp.auto_drop && machine.time_scale() > 1.01f) {
+                            machine.set_time_scale(1.0f);
+                            time_comp.alert_text = "TIME 1x (AUTO-DROP: WEAPONS)";
+                            time_comp.alert_until_sec = sim_clock_sec + 2.5;
+                        }
                         if (ev.type == SDL_EVENT_KEY_DOWN) {
                             if (ev.key.repeat) {
                                 // Never flood DOS with OS key-repeat on the trigger!
@@ -1651,7 +1726,8 @@ int main(int argc, char** argv) {
                 fm_write_thr = false;
             }
 
-            flight_model.step(dt_sec, ctrl);
+            double fm_dt = dt_sec * static_cast<double>(std::clamp(machine.time_scale(), 1.0f, 8.0f));
+            flight_model.step(std::min(fm_dt, 0.25), ctrl);
             float dyaw = std::abs(pre_tel.cam_yaw_deg - pre_tel.yaw_deg);
             if (dyaw > 180.0f) dyaw = 360.0f - dyaw;
             fm_sync_fwd_cam = (!pre_tel.is_external_cam && dyaw < 15.0f &&
@@ -1732,6 +1808,19 @@ int main(int argc, char** argv) {
             native_padlock_grace = 0;
             prev_missile_slots.fill(false);
             renderer.cockpit_3d().clear_views();
+            if (machine.time_scale() > 1.01f) machine.set_time_scale(1.0f);
+        }
+        // Smart Auto-Drop to 1x on incoming missile threat or low-altitude descent!
+        if (tel.in_flight && time_comp.auto_drop && machine.time_scale() > 1.01f) {
+            if (!tel.missiles.empty()) {
+                machine.set_time_scale(1.0f);
+                time_comp.alert_text = "TIME 1x (AUTO-DROP: MISSILE)";
+                time_comp.alert_until_sec = sim_clock_sec + 3.0;
+            } else if (tel.agl_ft < 500.0f && tel.airspeed_kts > 80.0f && tel.pitch_deg < -3.0f) {
+                machine.set_time_scale(1.0f);
+                time_comp.alert_text = "TIME 1x (AUTO-DROP: LOW ALT)";
+                time_comp.alert_until_sec = sim_clock_sec + 3.0;
+            }
         }
         prev_in_flight = tel.in_flight;
 
@@ -2003,7 +2092,8 @@ int main(int argc, char** argv) {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, falcon::VgaDevice::WIDTH, 200,
                             GL_RGBA, GL_UNSIGNED_BYTE, hud_rgba.data());
         }
-        renderer.render_frame(win_w, win_h, vga_tex, vga_cockpit_tex, vga_hud_tex, tel, static_cast<float>(dt_sec));
+        float render_dt = static_cast<float>(dt_sec * (tel.in_flight ? static_cast<double>(machine.time_scale()) : 1.0));
+        renderer.render_frame(win_w, win_h, vga_tex, vga_cockpit_tex, vga_hud_tex, tel, std::min(render_dt, 0.25f));
 
         // Poll OpenTrack / TrackIR UDP 4242 head tracker (feeds 360-deg 3D Virtual Cockpit Free-Look when connected!)
         head_tracker.poll(sim_clock_sec);
