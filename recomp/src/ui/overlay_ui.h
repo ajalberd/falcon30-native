@@ -17,7 +17,8 @@ class OverlayUI {
 public:
     OverlayUI(DosMachine& machine, AudioEngine& audio, HotasMapper& hotas,
               NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model,
-              HeadTracker& head_tracker, std::function<bool()> save_settings_cb = {});
+              HeadTracker& head_tracker, std::function<bool()> save_settings_cb = {},
+              std::function<void()> open_launcher_cb = {}, bool* show_launcher_ptr = nullptr);
 
     void draw(const FlightTelemetry& tel, double now_sec = 0.0);
 
@@ -34,6 +35,8 @@ private:
     F16FlightModel& flight_model_;
     HeadTracker& head_tracker_;
     std::function<bool()> save_settings_cb_;
+    std::function<void()> open_launcher_cb_;
+    bool* show_launcher_ptr_ = nullptr;
     double now_sec_ = 0.0;
     std::string config_status_;
 

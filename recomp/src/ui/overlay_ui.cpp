@@ -22,10 +22,13 @@ const char* hat_dir_name(uint8_t mask) {
 
 OverlayUI::OverlayUI(DosMachine& machine, AudioEngine& audio, HotasMapper& hotas,
                      NetUdp& net, ModernRenderer& renderer, F16FlightModel& flight_model,
-                     HeadTracker& head_tracker, std::function<bool()> save_settings_cb)
+                     HeadTracker& head_tracker, std::function<bool()> save_settings_cb,
+                     std::function<void()> open_launcher_cb, bool* show_launcher_ptr)
     : machine_(machine), audio_(audio), hotas_(hotas), net_(net),
       renderer_(renderer), flight_model_(flight_model), head_tracker_(head_tracker),
-      save_settings_cb_(std::move(save_settings_cb)) {
+      save_settings_cb_(std::move(save_settings_cb)),
+      open_launcher_cb_(std::move(open_launcher_cb)),
+      show_launcher_ptr_(show_launcher_ptr) {
     std::snprintf(rom_dir_buf_, sizeof(rom_dir_buf_), "%s", audio_.config().cm32l_rom_dir.c_str());
 }
 
@@ -47,7 +50,13 @@ void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
             if (ImGui::MenuItem("MiG-29: Deadly Adversary", nullptr, machine_.current_exe() == "MIGCD.EXE")) {
                 machine_.load_exe(machine_.game_dir(), "MIGCD.EXE");
             }
+            if (open_launcher_cb_ && ImGui::MenuItem("Return to Trilogy Launcher...")) {
+                open_launcher_cb_();
+            }
             ImGui::Separator();
+            if (show_launcher_ptr_) {
+                ImGui::MenuItem("Show Launcher on Startup", nullptr, show_launcher_ptr_);
+            }
             bool skip = machine_.skip_intro();
             if (ImGui::MenuItem("Skip Intro Video on Launch", nullptr, &skip)) {
                 machine_.set_skip_intro(skip);

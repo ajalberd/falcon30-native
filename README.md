@@ -37,7 +37,7 @@ Original 4:3 DOS software renderer:
   - NASA TP-1538 aero + GE F110 / P&W F100 thrust curves + 1G auto-trim FLCS synced live into Falcon's HUD, radar, and weapons.
 - **Live Non-Destructive SAM Realism Mod:** Patches Falcon's 16-missile RAM table at runtime (never modifies `.EXE` files on disk) to fix vanilla's infamous 80× SA-7 agility bug.
 - **Modern UDP Multiplayer Bridge (`F12 → Multiplayer`):** Bridges Novell IPX (`INT 7Ah`) over UDP/IP with a built-in Host/Join lobby.
-- **Zero-Config First-Run Setup & Persistent Settings (`falcon3_config.json`):** Just double-click `falcon30_native.exe`! If your Falcon Gold or Roland ROM folder isn't auto-detected, a native Windows folder picker prompts you once and saves all paths, render/VR settings, head-tracking config, audio mix, SAM preset, and window size automatically to `falcon3_config.json`.
+- **Built-In Falcon Gold Trilogy Launcher & Persistent Settings (`falcon3_config.json`):** Just double-click `falcon30_native.exe`! A built-in launcher lets you pick **Falcon 3.0 (F-16C)**, **Hornet: Naval Strike (F/A-18C)**, or **MiG-29: Deadly Adversary (MiG-29A)**, browse for your Falcon Gold and Roland CM-32L/MT-32 ROM folders with live detection badges, and toggle 3D/Widescreen/Fast-Boot/OpenTrack/SAM settings — saving everything automatically to `falcon3_config.json`. Return anytime via `F12 → Title → Return to Trilogy Launcher...` (or uncheck *Show Launcher on Startup* to boot straight into your last aircraft).
 - **Fast-Boot Skip Intro & 25-MIPS Disk Load Turbo:** Boots straight to the War Room in ~1.8 seconds while loading all 83 `Y.MID` CM-32L patches, and automatically accelerates mission/map loads.
 
 ---
@@ -117,7 +117,9 @@ cmake --build recomp/build --parallel
 |---|---|
 | `--game-dir <path>` | Path to your Falcon Gold install folder (root or `FALCON3` subfolder) |
 | `--rom-dir <path>` | Path to your Roland CM-32L / MT-32 `.ROM` folder |
-| `--exe <name>` | Launch `FALCONCD.EXE` (default), `HORNETCD.EXE`, or `MIGCD.EXE` |
+| `--exe <name>` | Launch `FALCONCD.EXE`, `HORNETCD.EXE`, or `MIGCD.EXE` directly (bypasses launcher) |
+| `--launcher` | Force-open the built-in Trilogy Launcher on startup |
+| `--no-launcher` | Skip the launcher and boot the last-used aircraft immediately |
 | `--test-fastboot` | Headless fast-boot smoke test (~1.8 s) |
 | `--trace-audio` | Log MIDI / SysEx / ROM sample baking diagnostics |
 
