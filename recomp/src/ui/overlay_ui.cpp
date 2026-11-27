@@ -1,7 +1,9 @@
 #include "ui/overlay_ui.h"
+#include "util/image_loader.h"
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -32,6 +34,29 @@ OverlayUI::OverlayUI(DosMachine& machine, AudioEngine& audio, HotasMapper& hotas
       show_launcher_ptr_(show_launcher_ptr),
       time_comp_ptr_(time_comp_ptr) {
     std::snprintf(rom_dir_buf_, sizeof(rom_dir_buf_), "%s", audio_.config().cm32l_rom_dir.c_str());
+}
+
+OverlayUI::~OverlayUI() {
+    if (keys_tex_) {
+        glDeleteTextures(1, &keys_tex_);
+        keys_tex_ = 0;
+    }
+}
+
+void OverlayUI::ensure_docs_and_keys_loaded() {
+    const std::string& gdir = machine_.game_dir();
+    if (docs_game_dir_ != gdir) {
+        docs_game_dir_ = gdir;
+        docs_ = discover_falcon_docs(gdir);
+        if (!keys_tex_) keys_load_tried_ = false;
+    }
+    if (!keys_load_tried_) {
+        keys_load_tried_ = true;
+        keys_png_path_ = find_quickstart_keys_png(gdir);
+        if (!keys_png_path_.empty()) {
+            keys_tex_ = load_png_texture_gl(keys_png_path_, keys_w_, keys_h_);
+        }
+    }
 }
 
 void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
@@ -128,6 +153,20 @@ void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
             if (ImGui::MenuItem("Restart Current Title")) {
                 machine_.load_exe(machine_.game_dir(), machine_.current_exe());
             }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Quickstart Keyboard Layout")) {
+                show_keys_ = true;
+            }
+            ensure_docs_and_keys_loaded();
+            for (const auto& doc : docs_) {
+                if (doc.is_pdf) {
+                    std::string item_lbl = "Open " + doc.label;
+                    if (ImGui::MenuItem(item_lbl.c_str())) {
+                        open_path_external(doc.path);
+                    }
+                    break;
+                }
+            }
             ImGui::EndMenu();
         }
 
@@ -136,6 +175,7 @@ void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
         ImGui::MenuItem("HOTAS Mapper", nullptr, &show_hotas_);
         ImGui::MenuItem("Audio", nullptr, &show_audio_);
         ImGui::MenuItem("Multiplayer (UDP)", nullptr, &show_multiplayer_);
+        ImGui::MenuItem("Quick Keys", nullptr, &show_keys_);
         ImGui::MenuItem("RE Debugger", nullptr, &show_debugger_);
         ImGui::Separator();
         ImGui::TextDisabled("[F9] Recenter Head | [F11] Render Mode | [F12] Overlay");
@@ -147,6 +187,7 @@ void OverlayUI::draw(const FlightTelemetry& tel, double now_sec) {
     if (show_hotas_) draw_hotas_window();
     if (show_audio_) draw_audio_window();
     if (show_multiplayer_) draw_multiplayer_window();
+    if (show_keys_) draw_quick_keys_window();
     if (show_debugger_) draw_debugger_window();
 }
 
@@ -757,6 +798,66 @@ void OverlayUI::draw_audio_window() {
     ImGui::SliderFloat("Avionics / Locks / RWR Bus", &cfg.avionics_bus_volume, 0.0f, 1.5f);
     ImGui::SliderFloat("Radio Comms (SB16) Bus", &cfg.sb16_sfx_volume, 0.0f, 1.5f);
     ImGui::SliderFloat("Menu Music (Live CM-32L)", &cfg.mt32_volume, 0.0f, 1.2f);
+
+    ImGui::End();
+}
+
+void OverlayUI::draw_quick_keys_window() {
+    ensure_docs_and_keys_loaded();
+    ImGuiIO& io = ImGui::GetIO();
+    float init_w = std::min(io.DisplaySize.x - 64.0f, 1120.0f);
+    float init_h = std::min(io.DisplaySize.y - 64.0f, 680.0f);
+    if (init_w < 540.0f) init_w = 540.0f;
+    if (init_h < 380.0f) init_h = 380.0f;
+    ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - init_w) * 0.5f, (io.DisplaySize.y - init_h) * 0.5f),
+                            ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(init_w, init_h), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Falcon 3.0 Gold — Quickstart Keyboard & HOTAS Layout", &show_keys_)) {
+        ImGui::End();
+        return;
+    }
+
+    if (keys_tex_ && keys_w_ > 0 && keys_h_ > 0) {
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        float img_h = std::max(140.0f, avail.y - 38.0f);
+        float aspect = static_cast<float>(keys_w_) / static_cast<float>(keys_h_);
+        float draw_w = avail.x;
+        float draw_h = draw_w / aspect;
+        if (draw_h > img_h) {
+            draw_h = img_h;
+            draw_w = draw_h * aspect;
+        }
+        float pad_x = std::max(0.0f, (avail.x - draw_w) * 0.5f);
+        if (pad_x > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad_x);
+        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(keys_tex_)), ImVec2(draw_w, draw_h));
+    } else {
+        ImGui::TextColored(ImVec4(0.98f, 0.78f, 0.34f, 1.0f),
+                           "Quickstart Controls Reference (docs\\Falcon30_Quickstart_Keys.png not found)");
+        ImGui::Separator();
+        ImGui::Text("NATIVE:  F12=Overlay | F11=Render Mode | F9=Recenter Head/IR | TAB=Time Comp (1x-8x) | RMB Drag=3D Free-Look");
+        ImGui::Text("VIEWS:   3=Fwd Pit (Recenter) | 4/5/6=Left/Rear/Right | 8/Shift+8=3D Padlock | 1/2/7/9/0/Q=External Cams");
+        ImGui::Text("WEAPONS: Space=Fire (Tap=Missile, Hold=M61 Gun) | Enter=Cycle A-A | Bksp=Cycle A-G | Ins=Chaff | Del=Flare | E=ECM");
+        ImGui::Text("RADAR:   F5=NAM | F6=ACM | F7=GM | F8=Range | F10=Elev | R=Radar On/Off | T=Cycle Target | Z=Lock | X=Unlock | C=REO");
+        ImGui::Text("FLIGHT:  Arrows=Stick | [/]=Rudder | +/-=Throttle | /=AB | ,/.=AB Stages | B=Airbrake | G=Gear | W=Brakes | A=AP | \\=ILS");
+    }
+
+    ImGui::Separator();
+    if (!keys_png_path_.empty()) {
+        if (ImGui::Button("Open PNG Externally")) {
+            open_path_external(keys_png_path_);
+        }
+    }
+    for (size_t i = 0; i < docs_.size() && i < 4; ++i) {
+        if (!keys_png_path_.empty() || i > 0) ImGui::SameLine();
+        std::string btn = "Open " + docs_[i].label;
+        if (ImGui::Button(btn.c_str())) {
+            open_path_external(docs_[i].path);
+        }
+    }
+    if (docs_.empty()) {
+        if (!keys_png_path_.empty()) ImGui::SameLine();
+        ImGui::TextDisabled("No PDF/TXT manuals found in Falcon Gold folder");
+    }
 
     ImGui::End();
 }

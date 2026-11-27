@@ -51,9 +51,11 @@ jobs:
 
       - name: Package Release Zip Artifact
         run: |
-          mkdir -p staging
+          mkdir -p staging/docs
           cp recomp/build/falcon30_native.exe staging/
           cp README.md LICENSE launch_falcon3.bat.example staging/
+          cp recomp/THIRD_PARTY_LICENSES.txt staging/
+          cp docs/Falcon30_Quickstart_Keys.png staging/docs/
           powershell -Command "Compress-Archive -Path staging/* -DestinationPath falcon30-native-win64.zip -Force"
 
       - name: Upload Build Artifact

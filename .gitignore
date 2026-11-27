@@ -25,16 +25,21 @@ game_data/
 
 # Build artifacts & local user configs
 recomp/build/
+recomp/third_party/*
+!recomp/third_party/stb/
 build/
+dist/
 out/
 *.obj
 *.o
 *.a
 *.lib
 *.dll
+*.res
 *.pdb
 *.ilk
 falcon3_hotas.json
+falcon3_config.json
 
 # Temporary captures & shortcuts
 *.ppm
@@ -42,6 +47,7 @@ falcon3_hotas.json
 *.jpg
 !docs/screenshots/*.png
 !docs/screenshots/*.jpg
+!docs/Falcon30_Quickstart_Keys.png
 *.ram
 *.log
 *.lnk

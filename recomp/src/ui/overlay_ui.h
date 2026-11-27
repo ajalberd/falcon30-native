@@ -7,9 +7,12 @@
 #include "net/net_udp.h"
 #include "render/modern_renderer.h"
 #include "sim/f16_flight_model.h"
+#include "util/game_detect.h"
 
+#include <SDL3/SDL_opengl.h>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace falcon {
 
@@ -33,6 +36,7 @@ public:
               HeadTracker& head_tracker, std::function<bool()> save_settings_cb = {},
               std::function<void()> open_launcher_cb = {}, bool* show_launcher_ptr = nullptr,
               TimeCompSettings* time_comp_ptr = nullptr);
+    ~OverlayUI();
 
     void draw(const FlightTelemetry& tel, double now_sec = 0.0);
 
@@ -61,18 +65,29 @@ private:
     bool show_render_ = true;
     bool show_flight_model_ = false;
     bool show_multiplayer_ = false;
+    bool show_keys_ = false;
     bool show_debugger_ = false;
+
+    GLuint keys_tex_ = 0;
+    int keys_w_ = 0;
+    int keys_h_ = 0;
+    bool keys_load_tried_ = false;
+    std::string keys_png_path_;
+    std::string docs_game_dir_;
+    std::vector<DiscoveredDoc> docs_;
 
     char rom_dir_buf_[512]{};
     char join_ip_buf_[128] = "127.0.0.1";
     int net_port_ = 19920;
     std::string profile_status_;
 
+    void ensure_docs_and_keys_loaded();
     void draw_hotas_window();
     void draw_audio_window();
     void draw_render_vr_window(const FlightTelemetry& tel);
     void draw_flight_model_window(const FlightTelemetry& tel);
     void draw_multiplayer_window();
+    void draw_quick_keys_window();
     void draw_debugger_window();
 };
 

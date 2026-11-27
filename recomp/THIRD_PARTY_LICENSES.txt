@@ -1,0 +1,49 @@
+Third-Party Software Licenses
+=============================
+
+1. SDL3 (Simple DirectMedia Layer)
+   https://libsdl.org/
+   License: zlib License
+
+Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
+
+This software is provided 'as-is', without any express or implied warranty.
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it freely,
+subject to the restrictions of the zlib License.
+
+
+2. Dear ImGui
+   https://github.com/ocornut/imgui
+   License: MIT License
+
+Copyright (c) 2014-2026 Omar Cornut
+
+
+3. libx86emu
+   https://github.com/wfeldt/libx86emu
+   License: BSD-3-Clause License
+
+Copyright (c) 1996-1999 SciTech Software, Inc. / Steffen Winterfeldt
+
+
+4. Munt libmt32emu
+   https://github.com/munt/munt
+   License: GNU Lesser General Public License v2.1 (LGPL-2.1)
+
+Copyright (C) 2003, 2004, 2005, 2006, 2008, 2009 Dean Beeler, Jerome Fisher
+Copyright (C) 2011-2026 Dean Beeler, Jerome Fisher, Sergey V. Mikayev
+
+
+5. nlohmann/json
+   https://github.com/nlohmann/json
+   License: MIT License
+
+Copyright (c) 2013-2026 Niels Lohmann
+
+
+6. stb_image.h
+   https://github.com/nothings/stb
+   License: MIT License / Public Domain (Unlicense)
+
+Copyright (c) 2017 Sean Barrett

@@ -6,6 +6,8 @@
 #include "render/modern_renderer.h"
 #include "sim/f16_flight_model.h"
 #include "ui/overlay_ui.h"
+#include "util/game_detect.h"
+#include "util/image_loader.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_opengl.h>
@@ -75,13 +77,13 @@ uint8_t sdl_scancode_to_dos(SDL_Scancode sc) {
 }
 
 std::string resolve_falcon_dir(const fs::path& base) {
-    if (base.empty()) return "";
-    if (fs::exists(base / "FALCONCD.EXE")) return fs::absolute(base).string();
-    if (fs::exists(base / "FALCON3" / "FALCONCD.EXE")) return fs::absolute(base / "FALCON3").string();
-    return "";
+    return falcon::resolve_falcon_game_dir(base);
 }
 
+bool g_game_dir_auto_detected = false;
+
 std::string find_game_dir(const std::string& explicit_dir, int argc, char** argv) {
+    g_game_dir_auto_detected = false;
     if (!explicit_dir.empty()) {
         std::string r = resolve_falcon_dir(explicit_dir);
         if (!r.empty()) return r;
@@ -94,22 +96,27 @@ std::string find_game_dir(const std::string& explicit_dir, int argc, char** argv
         std::string r = resolve_falcon_dir(env_dir);
         if (!r.empty()) return r;
     }
-    const char* candidates[] = {
+    // Check exe directory & local relative folders first
+    fs::path exe_dir = falcon::get_executable_dir();
+    const std::vector<fs::path> local_candidates = {
+        exe_dir,
+        exe_dir / "game_data",
         ".",
         "game_data",
         "../game_data",
         "../../game_data",
         "..",
         "../..",
-        R"(C:\GOG Games\Falcon Gold)",
-        R"(D:\GOG Games\Falcon Gold)",
-        R"(E:\GOG Games\Falcon Gold)",
-        R"(C:\Program Files (x86)\GOG Galaxy\Games\Falcon Gold)",
-        R"(D:\Program Files (x86)\GOG Galaxy\Games\Falcon Gold)"
     };
-    for (const char* c : candidates) {
+    for (const auto& c : local_candidates) {
         std::string r = resolve_falcon_dir(c);
         if (!r.empty()) return r;
+    }
+    // Thorough Windows Registry (GOG / Uninstall / Steam) + C:..H: auto-detection
+    std::string reg_dir = falcon::detect_falcon_gold_auto();
+    if (!reg_dir.empty()) {
+        g_game_dir_auto_detected = true;
+        return reg_dir;
     }
     return ".";
 }
@@ -157,6 +164,10 @@ fs::path resolve_config_dir(const std::string& game_dir) {
         if (leaf == "game_data" && gd.has_parent_path()) {
             return gd.parent_path();
         }
+    }
+    fs::path exe_dir = falcon::get_executable_dir();
+    if (!exe_dir.empty() && fs::exists(exe_dir / "falcon3_config.json", ec)) {
+        return exe_dir;
     }
     return fs::current_path(ec);
 }
@@ -582,6 +593,16 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
     bool avail[3] = {false, false, false};
     int def_fm[3] = {2, 3, 2}; // In-game .DEF[+0x06] Flight Model per title (0=Simple,1=Mod,2=Complex,3=Hi-Fi)
     bool roms_ok = false;
+    std::vector<falcon::DiscoveredDoc> discovered_docs;
+    std::string keys_png_path;
+    GLuint keys_tex = 0;
+    int keys_w = 0, keys_h = 0;
+    bool show_keys_modal = false;
+    std::string status_note;
+    if (g_game_dir_auto_detected) {
+        status_note = "Auto-detected Falcon Gold from Windows Registry";
+    }
+
     auto refresh_detection = [&]() {
         for (int i = 0; i < 3; ++i) {
             avail[i] = has_exe_in_dir(game_dir, kTitles[i].exe);
@@ -591,17 +612,34 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             def_fm[i] = fm;
         }
         roms_ok = has_mt32_roms_in(rom_dir);
+        discovered_docs = falcon::discover_falcon_docs(game_dir);
+        std::string new_png = falcon::find_quickstart_keys_png(game_dir);
+        if (new_png != keys_png_path) {
+            keys_png_path = new_png;
+            if (keys_tex) {
+                glDeleteTextures(1, &keys_tex);
+                keys_tex = 0;
+                keys_w = keys_h = 0;
+            }
+            if (!keys_png_path.empty()) {
+                keys_tex = falcon::load_png_texture_gl(keys_png_path, keys_w, keys_h);
+            }
+        }
     };
     refresh_detection();
 
-    // Open Launcher in a clean, compact 1024x768 centered window (restores saved game size on Launch/Resume!)
+    // Open Launcher in a clean, compact 1040x836 centered window (restores saved game size on Launch/Resume!)
     int prev_win_w = 1280, prev_win_h = 800;
     SDL_GetWindowSize(window, &prev_win_w, &prev_win_h);
-    SDL_SetWindowSize(window, 1024, 768);
+    SDL_SetWindowSize(window, 1040, 836);
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     SDL_SetWindowTitle(window, "Falcon 3.0 Gold — Trilogy Launcher");
 
     auto commit_and_restore = [&](LauncherOutcome res) -> LauncherOutcome {
+        if (keys_tex) {
+            glDeleteTextures(1, &keys_tex);
+            keys_tex = 0;
+        }
         if (res == LauncherOutcome::Launch) {
             int fm_val = (sel_idx == 2) ? std::min(def_fm[sel_idx], 2) : def_fm[sel_idx];
             write_def_flight_model(game_dir, def_file_for_exe(kTitles[sel_idx].exe), fm_val);
@@ -620,18 +658,23 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             if (ev.type == SDL_EVENT_QUIT) {
                 return commit_and_restore(LauncherOutcome::Quit);
             }
-            if (ev.type == SDL_EVENT_KEY_DOWN) {
-                if (ev.key.scancode == SDL_SCANCODE_ESCAPE && in_game_return) {
-                    return commit_and_restore(LauncherOutcome::Cancel);
-                }
-                if (ev.key.scancode == SDL_SCANCODE_LEFT) {
-                    sel_idx = (sel_idx + 2) % 3;
-                } else if (ev.key.scancode == SDL_SCANCODE_RIGHT) {
-                    sel_idx = (sel_idx + 1) % 3;
-                } else if ((ev.key.scancode == SDL_SCANCODE_RETURN || ev.key.scancode == SDL_SCANCODE_KP_ENTER) &&
-                           avail[sel_idx]) {
-                    selected_exe = kTitles[sel_idx].exe;
-                    return commit_and_restore(LauncherOutcome::Launch);
+            if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat) {
+                if (ev.key.scancode == SDL_SCANCODE_ESCAPE) {
+                    if (show_keys_modal) {
+                        show_keys_modal = false;
+                    } else if (in_game_return) {
+                        return commit_and_restore(LauncherOutcome::Cancel);
+                    }
+                } else if (!show_keys_modal) {
+                    if (ev.key.scancode == SDL_SCANCODE_LEFT) {
+                        sel_idx = (sel_idx + 2) % 3;
+                    } else if (ev.key.scancode == SDL_SCANCODE_RIGHT) {
+                        sel_idx = (sel_idx + 1) % 3;
+                    } else if ((ev.key.scancode == SDL_SCANCODE_RETURN || ev.key.scancode == SDL_SCANCODE_KP_ENTER) &&
+                               avail[sel_idx]) {
+                        selected_exe = kTitles[sel_idx].exe;
+                        return commit_and_restore(LauncherOutcome::Launch);
+                    }
                 }
             }
         }
@@ -676,6 +719,43 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
+
+            if (show_keys_modal) {
+                ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f), "QUICKSTART KEYBOARD & HOTAS LAYOUT");
+                ImGui::SameLine(content_w - 340.0f);
+                if (!keys_png_path.empty() && ImGui::Button("Open PNG Externally", ImVec2(170.0f, 28.0f))) {
+                    falcon::open_path_external(keys_png_path);
+                    status_note = "Opened Falcon30_Quickstart_Keys.png";
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Back to Launcher (Esc)", ImVec2(160.0f, 28.0f))) {
+                    show_keys_modal = false;
+                }
+                ImGui::Spacing();
+
+                float viewer_h = std::max(320.0f, static_cast<float>(win_h) - 180.0f);
+                if (keys_tex && keys_w > 0 && keys_h > 0) {
+                    float aspect = static_cast<float>(keys_w) / static_cast<float>(keys_h);
+                    float draw_w = content_w;
+                    float draw_h = draw_w / aspect;
+                    if (draw_h > viewer_h) {
+                        draw_h = viewer_h;
+                        draw_w = draw_h * aspect;
+                    }
+                    float pad = std::max(0.0f, (content_w - draw_w) * 0.5f);
+                    if (pad > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + pad);
+                    ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(keys_tex)), ImVec2(draw_w, draw_h));
+                } else {
+                    ImGui::TextColored(ImVec4(0.98f, 0.76f, 0.30f, 1.0f),
+                                       "docs\\Falcon30_Quickstart_Keys.png not found. Essential Keys:");
+                    ImGui::Spacing();
+                    ImGui::Text("NATIVE:  F12=Overlay | F11=3D Render Mode | F9=Recenter Head/IR | TAB=Time Comp (1x-8x) | RMB Drag=3D Free-Look");
+                    ImGui::Text("VIEWS:   3=Fwd Pit | 4/5/6=Left/Rear/Right | 8/Shift+8=3D Padlock | 1/2/7/9/0/Q=External Cams");
+                    ImGui::Text("WEAPONS: Space=Fire (Tap=Missile, Hold=M61) | Enter=A-A | Bksp=A-G | Ins=Chaff | Del=Flare | E=ECM");
+                    ImGui::Text("RADAR:   F5=NAM | F6=ACM | F7=GM | F8=Range | F10=Elev | R=On/Off | T=Target | Z=Lock | X=Unlock | C=REO");
+                    ImGui::Text("FLIGHT:  Arrows=Stick | [/]=Rudder | +/-=Throttle | /=AB | ,/.=AB Stages | B=Airbrake | G=Gear | A=AP | \\=ILS");
+                }
+            } else {
 
             // Warning banner if no game EXEs found yet
             if (!avail[0] && !avail[1] && !avail[2]) {
@@ -830,6 +910,46 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
 
             ImGui::Spacing();
 
+            // Manuals & Quickstart Reference Panel
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.075f, 0.102f, 0.148f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.26f, 0.35f, 0.90f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+            ImGui::BeginChild("##DocsPanel", ImVec2(content_w, 74.0f), ImGuiChildFlags_Borders);
+            ImGui::SetCursorPos(ImVec2(14.0f, 8.0f));
+            ImGui::TextColored(ImVec4(0.55f, 0.82f, 1.0f, 1.0f), "MANUALS & QUICKSTART REFERENCE");
+
+            ImGui::SetCursorPos(ImVec2(14.0f, 34.0f));
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.36f, 0.28f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.50f, 0.38f, 1.0f));
+            if (ImGui::Button("Quickstart Keyboard Layout", ImVec2(220.0f, 30.0f))) {
+                show_keys_modal = true;
+            }
+            ImGui::PopStyleColor(2);
+
+            if (discovered_docs.empty()) {
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextDisabled("  Select your Falcon Gold folder above to auto-discover PDF manuals & readmes.");
+            } else {
+                for (size_t di = 0; di < discovered_docs.size() && di < 4; ++di) {
+                    const auto& doc = discovered_docs[di];
+                    ImGui::SameLine();
+                    float btn_w = std::clamp(ImGui::CalcTextSize(doc.label.c_str()).x + 24.0f, 130.0f, 220.0f);
+                    if (ImGui::Button(doc.label.c_str(), ImVec2(btn_w, 30.0f))) {
+                        falcon::open_path_external(doc.path);
+                        status_note = "Opened " + doc.label;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", doc.path.c_str());
+                    }
+                }
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(2);
+
+            ImGui::Spacing();
+
             // Quick Flight Settings Panel
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.075f, 0.102f, 0.148f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.26f, 0.35f, 0.90f));
@@ -945,6 +1065,10 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                     outcome = LauncherOutcome::Cancel;
                     decided = true;
                 }
+            } else if (!status_note.empty()) {
+                ImGui::SameLine();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(ImVec4(0.48f, 0.94f, 0.62f, 1.0f), "  %s", status_note.c_str());
             }
 
             ImGui::SameLine(content_w - 120.0f);
@@ -955,6 +1079,8 @@ LauncherOutcome run_trilogy_launcher(SDL_Window* window,
                 decided = true;
             }
             ImGui::PopStyleColor(2);
+
+            } // !show_keys_modal
 
             ImGui::EndGroup();
         }
@@ -1029,15 +1155,19 @@ int main(int argc, char** argv) {
     }
 
     // Peek saved game_dir / rom_dir from falcon3_config.json (CLI flags always take priority!)
-    std::string cfg_dir_hint = (fs::current_path() / "falcon3_config.json").string();
+    std::string exe_cfg_hint = (falcon::get_executable_dir() / "falcon3_config.json").string();
+    std::string cwd_cfg_hint = (fs::current_path() / "falcon3_config.json").string();
     std::string saved_game_dir, saved_rom_dir;
-    peek_saved_paths(cfg_dir_hint, saved_game_dir, saved_rom_dir);
+    peek_saved_paths(exe_cfg_hint, saved_game_dir, saved_rom_dir);
+    if (saved_game_dir.empty() || saved_rom_dir.empty()) {
+        peek_saved_paths(cwd_cfg_hint, saved_game_dir, saved_rom_dir);
+    }
 
     std::string game_dir = find_game_dir(!explicit_game_dir.empty() ? explicit_game_dir : saved_game_dir, argc, argv);
     fs::path cfg_dir = resolve_config_dir(game_dir);
     std::string config_path = (cfg_dir / "falcon3_config.json").string();
     std::string hotas_path  = (cfg_dir / "falcon3_hotas.json").string();
-    if (saved_rom_dir.empty() && config_path != cfg_dir_hint) {
+    if (saved_rom_dir.empty() && config_path != cwd_cfg_hint && config_path != exe_cfg_hint) {
         std::string dummy_gd;
         peek_saved_paths(config_path, dummy_gd, saved_rom_dir);
     }

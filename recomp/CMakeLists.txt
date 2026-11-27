@@ -105,10 +105,12 @@ add_executable(falcon30_native
     src/render/modern_renderer.cpp
     src/sim/f16_flight_model.cpp
     src/ui/overlay_ui.cpp
+    src/util/image_loader.cpp
 )
 
 target_include_directories(falcon30_native PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
 )
 
 target_link_libraries(falcon30_native PRIVATE
@@ -121,7 +123,7 @@ target_link_libraries(falcon30_native PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(falcon30_native PRIVATE winmm ws2_32)
+    target_link_libraries(falcon30_native PRIVATE winmm ws2_32 advapi32 shell32 ole32)
     if(MINGW)
         target_link_options(falcon30_native PRIVATE -static -static-libgcc -static-libstdc++)
     endif()
